@@ -1,0 +1,41 @@
+{
+    "manifest_version": 3,
+    "name": "Nexus Download Manager",
+    "version": "1.0",
+    "description": "Intercepts downloads and detects media for Nexus Manager.",
+    "permissions": [
+        "downloads",
+        "downloads.shelf",
+        "webRequest",
+        "scripting",
+        "storage",
+        "activeTab",
+        "cookies",
+        "notifications"
+    ],
+    "host_permissions": [
+        "<all_urls>",
+        "http://127.0.0.1:5000/*",
+        "http://127.0.0.1:4578/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "css": [
+                "styles.css"
+            ],
+            "run_at": "document_idle"
+        }
+    ],
+    "action": {
+        "default_popup": "popup.html"
+    }
+}

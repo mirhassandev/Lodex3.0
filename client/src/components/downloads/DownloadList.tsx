@@ -1,7 +1,8 @@
 import React from "react";
 import { DownloadItem, getIconForType, FileType } from "@/lib/mock-data";
 import { cn } from "@/lib/utils";
-import { MoreHorizontal, FolderOpen, Play, Pause, RefreshCw, Download, ShieldCheck, Zap } from "lucide-react";
+import { MoreHorizontal, FolderOpen, Play, Pause, RefreshCw, X, MoreVertical, ArrowUp, ArrowDown, ChevronDown, CheckCircle2, AlertCircle, Clock, Zap, Download, ShieldCheck } from "lucide-react";
+import { formatBytes } from "@/lib/formatters";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -83,6 +84,14 @@ export function DownloadList({ downloads, filter, setDownloads, selectedIds, onT
                     <Icon className="w-4 h-4" />
                   </div>
                   <span className="font-medium text-sm truncate" title={item.name}>{item.name}</span>
+                  {item.priority && item.priority !== 'normal' && (
+                    <span className={cn(
+                      "text-[8px] px-1.5 py-0.5 rounded font-black uppercase tracking-tighter",
+                      item.priority === 'high' ? "bg-red-500/20 text-red-400 border border-red-500/20" : "bg-blue-500/20 text-blue-400 border border-blue-500/20"
+                    )}>
+                      {item.priority}
+                    </span>
+                  )}
                 </div>
 
                 {/* Progress Bar */}
@@ -103,7 +112,32 @@ export function DownloadList({ downloads, filter, setDownloads, selectedIds, onT
                   </div>
                 </div>
                 <div className="flex justify-between mt-1 text-[10px] text-muted-foreground font-mono">
-                  <span>{item.status === 'completed' ? 'Done' : `${Math.min(100, item.progress).toFixed(1)}%`}</span>
+                  <div className="flex items-center gap-2">
+                    <span>{item.status === 'completed' ? 'Done' : `${Math.min(100, item.progress).toFixed(1)}%`}</span>
+                    {isDownloading && item.connections && (
+                      <span className="text-secondary-foreground/40 bg-white/5 px-1.5 rounded flex items-center gap-1">
+                        <Zap className="w-2.5 h-2.5 text-yellow-500/50" /> {item.connections} conn
+                      </span>
+                    )}
+                    {isDownloading && item.segmentsTotal && (
+                      <span className="text-muted-foreground">
+                        {item.merging ? (
+                          <span className="text-blue-400 animate-pulse flex items-center gap-1">
+                            <RefreshCw className="w-3 h-3 animate-spin" /> Merging...
+                          </span>
+                        ) : (
+                          <>
+                            {item.downloadedBytes ? formatBytes(item.downloadedBytes) : "0 B"} / {item.totalBytes ? formatBytes(item.totalBytes) : "Unknown"}
+                            {item.segmentsTotal && item.segmentsTotal > 0 && (
+                              <span className="ml-2 text-[10px] bg-muted px-1.5 py-0.5 rounded text-muted-foreground uppercase tracking-tight">
+                                Segments: {item.segmentsDone || 0}/{item.segmentsTotal}
+                              </span>
+                            )}
+                          </>
+                        )}
+                      </span>
+                    )}
+                  </div>
                   <span>{isDownloading ? item.url.split('/')[2] : ''}</span>
                 </div>
               </div>
@@ -117,9 +151,16 @@ export function DownloadList({ downloads, filter, setDownloads, selectedIds, onT
                     item.status === "completed" ? "bg-green-500/20 text-green-500 border border-green-500/20" :
                       item.status === "paused" ? "bg-yellow-500/20 text-yellow-500 border border-yellow-500/20" :
                         item.status === "queued" ? "bg-secondary text-muted-foreground border border-border" :
-                          "bg-destructive/20 text-destructive border border-destructive/20"
+                          item.status === "scheduled" ? "bg-blue-500/20 text-blue-400 border border-blue-500/20" :
+                            item.status === "retrying" ? "bg-orange-500/20 text-orange-400 border border-orange-500/20 animate-pulse" :
+                              "bg-destructive/20 text-destructive border border-destructive/20"
                 )}>
                   {item.status === 'downloading' && item.progress >= 100 ? 'Finalizing' : item.status}
+                  {item.status === 'scheduled' && item.scheduledAt && (
+                    <span className="ml-1 opacity-60 normal-case font-mono">
+                      @ {new Date(item.scheduledAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  )}
                 </span>
               </div>
 
@@ -218,6 +259,29 @@ export function DownloadList({ downloads, filter, setDownloads, selectedIds, onT
                     >
                       <RefreshCw className="w-4 h-4" />
                     </Button>
+                  )}
+
+                  {item.status === "queued" && (
+                    <>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                        onClick={() => (window as any).electronAPI?.moveUpDownload(item.id)}
+                        title="Move Up"
+                      >
+                        <ArrowUp className="w-4 h-4" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                        onClick={() => (window as any).electronAPI?.moveDownDownload(item.id)}
+                        title="Move Down"
+                      >
+                        <ArrowDown className="w-4 h-4" />
+                      </Button>
+                    </>
                   )}
 
                   <DropdownMenu>

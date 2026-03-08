@@ -1,9 +1,17 @@
-const http = require('http');
-const https = require('https');
-const fs = require('fs');
-const { URL } = require('url');
+'use strict';
+
 const EventEmitter = require('events');
-const ytdl = require('@distube/ytdl-core');
+const https = require('https');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+
+const { StreamTask } = require('./stream-downloader.cjs');
+const { classify } = require('./url-classifier.cjs');
+const { SegmentedDownloader } = require('./segmented-downloader.cjs');
+const { QueueManager } = require('./queue-manager.cjs');
+const { requestWithRedirect, headWithRedirect } = require('./request-utils.cjs');
 
 class DownloadTask extends EventEmitter {
   constructor(id, url, outPath, options = {}) {
@@ -11,6 +19,8 @@ class DownloadTask extends EventEmitter {
     this.id = id;
     this.url = url;
     this.outPath = outPath;
+    this.options = options;
+    this.status = 'queued';
     this.aborted = false;
     this.completed = false; // Explicit completion status
     this.error = null;
@@ -21,45 +31,28 @@ class DownloadTask extends EventEmitter {
     this.downloaded = 0;
     this.ranges = [];
     this.fileHandle = null;
-    this.manifestPath = `${outPath}.download.json`;
+    this.manifestPath = `${outPath}.download.meta`;
     this.ytdlStream = null;
     this.resolution = options.resolution;
     this.title = options.title;
+    this.customHeaders = options.headers || {};
+
+    this.speedInterval = null;
+    this.speedLimit = 0; // 0 = unlimited
+  }
+
+  throttle(limit) {
+    this.speedLimit = limit;
+    console.log(`[DownloadTask] Throttling for ${this.id}: ${limit} B/s`);
   }
 
   async headRequest() {
-    const urlObj = new URL(this.url);
-    const lib = urlObj.protocol === 'https:' ? https : http;
-
-    return new Promise((resolve, reject) => {
-      const req = lib.request(
-        {
-          method: 'HEAD',
-          host: urlObj.hostname,
-          path: urlObj.pathname + urlObj.search,
-          port: urlObj.port || undefined,
-          timeout: this.timeout,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-          }
-        },
-        (res) => {
-          const length = parseInt(res.headers['content-length'] || '0', 10);
-          const acceptRanges = res.headers['accept-ranges'] === 'bytes';
-          resolve({ length, acceptRanges, headers: res.headers });
-        },
-      );
-
-      req.on('error', () => {
-        // HEAD request failed, return empty result to trigger GET fallback
-        resolve({ length: 0, acceptRanges: false, headers: {} });
-      });
-      req.on('timeout', () => {
-        req.destroy();
-        resolve({ length: 0, acceptRanges: false, headers: {} });
-      });
-      req.end();
-    });
+    try {
+      return await headWithRedirect(this.url, this.customHeaders, this.timeout);
+    } catch (err) {
+      console.warn(`[DownloadTask] Head request failed for ${this.id}, falling back to GET:`, err.message);
+      return { length: 0, acceptRanges: false, headers: {} };
+    }
   }
 
   splitRanges(total, parts) {
@@ -75,31 +68,107 @@ class DownloadTask extends EventEmitter {
   }
 
   async start() {
-    if (this.fileHandle) return; // already started
+    if (this.status === 'downloading') return;
 
-    // Check for YouTube
-    if (this.url.includes('youtube.com') || this.url.includes('youtu.be')) {
-      return this._startYouTubeDownload();
+    this.status = 'downloading';
+    console.log(`[DownloadTask] Starting task: ${this.id} (${this.url.substring(0, 50)}...)`);
+
+    // Emit early started so UI shows connecting/downloading status
+    this.emit('started', { id: this.id, size: this.size || 0 });
+
+    try {
+      // Check for YouTube
+      if (this.url.includes('youtube.com') || this.url.includes('youtu.be') || this.protocol === 'ytdlp') {
+        console.log(`[DownloadTask] Routed to YouTube/yt-dlp handler: ${this.id}`);
+        this._startSpeedTicker();
+        return await this._startYouTubeDownload();
+      }
+
+      console.log(`[DownloadTask] Probing server: ${this.id}`);
+
+      const startTimeout = setTimeout(() => {
+        if (this.status === 'downloading' && this.downloaded === 0) {
+          console.error(`[DownloadTask] Start timeout for ${this.id}`);
+          this.emit('error', new Error('Connection timed out during start'));
+          this.cancel();
+        }
+      }, 30000);
+
+      const head = await this.headRequest();
+      
+      if (head.finalUrl && head.finalUrl !== this.url) {
+        console.log(`[DownloadTask] Redirect detected: ${this.url} -> ${head.finalUrl}`);
+        this.url = head.finalUrl;
+      }
+
+      this.once('progress', () => clearTimeout(startTimeout));
+      this.once('finished', () => clearTimeout(startTimeout));
+      this.once('error', () => clearTimeout(startTimeout));
+
+      // If we got content-length and server supports ranges, use segmented download
+      if (head.size > 0 && head.acceptRanges) {
+        console.log(`[DownloadTask] Range support detected. Size: ${head.size}`);
+        this.size = head.size;
+
+        // Dynamic segmentation strategy based on file size
+        if (this.size > 1024 * 1024 * 1024) this.connections = 16;
+        else if (this.size > 100 * 1024 * 1024) this.connections = 8;
+        else if (this.size > 10 * 1024 * 1024) this.connections = 4;
+        else this.connections = 2;
+
+        this.ranges = this.splitRanges(this.size, this.connections);
+
+        // create or truncate output file to the full size
+        await fs.promises.writeFile(this.outPath, Buffer.alloc(1), { flag: 'w' });
+        const fd = await fs.promises.open(this.outPath, 'r+');
+        this.fileHandle = fd;
+
+        this.emit('started', { id: this.id, size: this.size }); // Update with real size
+        this._startSpeedTicker();
+        this._runRanges();
+      } else {
+        // Fallback to simple streaming download (for video hosts, etc.)
+        console.log(`[DownloadTask] No range support. Falling back to stream: ${this.id}`);
+        this._startSpeedTicker();
+        return await this._streamDownload();
+      }
+    } catch (err) {
+      console.error(`[DownloadTask] Start failed critically for ${this.id}:`, err.message);
+      this.emit('error', err);
     }
+  }
 
-    const head = await this.headRequest();
+  _startSpeedTicker() {
+    if (this.speedInterval) clearInterval(this.speedInterval);
+    this.lastDownloaded = this.downloaded || 0;
+    this.speedHistory = [];
 
-    // If we got content-length and server supports ranges, use segmented download
-    if (head.length > 0 && head.acceptRanges) {
-      this.size = head.length;
-      this.ranges = this.splitRanges(this.size, this.connections);
+    this.speedInterval = setInterval(() => {
+      if (this.aborted || this.completed) {
+        clearInterval(this.speedInterval);
+        return;
+      }
 
-      // create or truncate output file to the full size
-      await fs.promises.writeFile(this.outPath, Buffer.alloc(1), { flag: 'w' });
-      const fd = await fs.promises.open(this.outPath, 'r+');
-      this.fileHandle = fd;
+      const downloadedNow = this.downloaded || 0;
+      const bytesPerSec = downloadedNow - this.lastDownloaded;
+      this.lastDownloaded = downloadedNow;
 
-      this.emit('started', { id: this.id, size: this.size });
-      this._runRanges();
-    } else {
-      // Fallback to simple streaming download (for video hosts, etc.)
-      return await this._streamDownload();
-    }
+      this.speedHistory.push(bytesPerSec);
+      if (this.speedHistory.length > 5) this.speedHistory.shift();
+
+      const avgSpeed = this.speedHistory.length > 0 ? this.speedHistory.reduce((a, b) => a + b, 0) / this.speedHistory.length : 0;
+      const remainingBytes = this.size > 0 ? this.size - downloadedNow : 0;
+      const eta = avgSpeed > 0 ? Math.round(remainingBytes / avgSpeed) : 0;
+
+      // Ensure we only emit progress if size is known or we're streaming
+      this.emit('progress', {
+        id: this.id,
+        downloaded: downloadedNow,
+        total: this.size,
+        speed: avgSpeed,
+        eta: eta
+      });
+    }, 1000);
   }
 
   async _startYouTubeDownload() {
@@ -123,26 +192,55 @@ class DownloadTask extends EventEmitter {
       const ffmpegPath = tempFfmpeg;
       console.log('[Downloader] Using temp ffmpegPath:', ffmpegPath);
 
-      // If we have a specific resolution, use yt-dlp to handle format selection and muxing
-      // Syntax: bestvideo[height<=?1080]+bestaudio/best[height<=?1080]
-      const height = this.resolution ? parseInt(this.resolution, 10) : 1080;
-      const formatStr = `bestvideo[height<=?${height}]+bestaudio/best[height<=?${height}]`;
+      // 1. Resolve format strategy
+      let formatStr = 'best';
+      const extractionArgs = [];
+
+      if (this.options.isAudioOnly || this.options.quality === 'audio') {
+        const isMP3 = this.options.isAudioOnly && this.options.filename.toLowerCase().endsWith('.mp3');
+        formatStr = 'bestaudio/best';
+
+        if (isMP3) {
+          extractionArgs.push('--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0');
+        }
+      } else {
+        const height = this.resolution ? parseInt(this.resolution, 10) : 1080;
+        formatStr = `bestvideo[height<=?${height}]+bestaudio/best[height<=?${height}]`;
+      }
+
+      // Respect custom headers (Cookies, Referer, etc.)
+      const headerArgs = [];
+      Object.entries(this.customHeaders).forEach(([key, value]) => {
+        if (value) {
+          headerArgs.push('--add-header', `${key}:${value}`);
+        }
+      });
 
       const args = [
         this.url,
         '--format', formatStr,
         '--ffmpeg-location', ffmpegPath,
-        '--merge-output-format', 'mp4',
+        ...extractionArgs,
+        '--merge-output-format', extractionArgs.length > 0 ? '' : 'mp4',
         '--output', this.outPath,
         '--force-overwrites',
         '--no-playlist',
         '--newline',
-        '--add-header', 'referer:youtube.com',
-        '--add-header', 'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        ...headerArgs
       ];
 
+      // Add default headers if not provided
+      if (!this.customHeaders['Referer'] && !this.customHeaders['referer']) {
+        args.push('--add-header', 'referer:youtube.com');
+      }
+
+      console.log('[Downloader] Spawning yt-dlp with args:', args.join(' '));
       const subprocess = spawn(ytpPath, args);
       this.ytdlStream = subprocess;
+
+      subprocess.on('spawn', () => {
+        console.log(`[DownloadTask] YouTube downloader started (PID: ${subprocess.pid})`);
+      });
 
       subprocess.stdout.on('data', (data) => {
         const line = data.toString();
@@ -172,7 +270,8 @@ class DownloadTask extends EventEmitter {
       });
 
       subprocess.stderr.on('data', (data) => {
-        console.error('yt-dlp stderr:', data.toString());
+        this.lastStderr = data.toString();
+        console.error('yt-dlp stderr:', this.lastStderr);
       });
 
       subprocess.on('close', (code) => {
@@ -180,7 +279,9 @@ class DownloadTask extends EventEmitter {
           this.completed = true;
           this.emit('finished', { id: this.id, path: this.outPath });
         } else if (!this.aborted) {
-          this.emit('error', new Error(`yt-dlp exited with code ${code}`));
+          const errorMsg = `yt-dlp failed (code ${code}). ${this.lastStderr || ''}`;
+          console.error('[Downloader] YouTube Error:', errorMsg);
+          this.emit('error', new Error(errorMsg));
         }
       });
 
@@ -195,81 +296,71 @@ class DownloadTask extends EventEmitter {
   }
 
   async _streamDownload() {
-    const urlObj = new URL(this.url);
-    const lib = urlObj.protocol === 'https:' ? https : http;
+    try {
+      const res = await requestWithRedirect(this.url, {
+         method: 'GET',
+         headers: {
+           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+           ...this.customHeaders
+         },
+         timeout: this.timeout
+      });
 
-    return new Promise((resolve, reject) => {
-      const req = lib.request(
-        {
-          method: 'GET',
-          host: urlObj.hostname,
-          path: urlObj.pathname + urlObj.search,
-          port: urlObj.port || undefined,
-          timeout: this.timeout,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-          }
-        },
-        async (res) => {
-          if (res.statusCode >= 400) {
-            const error = new Error(`HTTP ${res.statusCode}`);
-            this.emit('error', error);
-            reject(error);
-            return;
-          }
+      if (res.statusCode >= 400) {
+        throw new Error(`HTTP ${res.statusCode}`);
+      }
 
-          const contentLength = parseInt(res.headers['content-length'] || '0', 10);
-          if (contentLength > 0) {
-            this.size = contentLength;
-            this.emit('started', { id: this.id, size: contentLength });
-          } else {
-            // No content-length, emit started with unknown size
-            this.emit('started', { id: this.id, size: 0 });
-          }
+      // Update URL to final direct target if it redirected
+      if (res.finalUrl && res.finalUrl !== this.url) {
+        this.url = res.finalUrl;
+      }
 
-          // Create writable file stream
-          const writeStream = fs.createWriteStream(this.outPath);
+      const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+      if (contentLength > 0) {
+        this.size = contentLength;
+        this.emit('started', { id: this.id, size: contentLength });
+      } else {
+        this.emit('started', { id: this.id, size: 0 });
+      }
 
-          res.on('data', (chunk) => {
-            this.downloaded += chunk.length;
-            this.emit('progress', { id: this.id, downloaded: this.downloaded, total: this.size });
-          });
+      const writeStream = fs.createWriteStream(this.outPath);
 
-          res.pipe(writeStream);
-
-          writeStream.on('finish', () => {
-            this.completed = true; // Mark completed
-            this.emit('finished', { id: this.id, path: this.outPath });
-            resolve();
-          });
-
-          writeStream.on('error', (err) => {
-            this.emit('error', err);
-            reject(err);
-          });
-
-          res.on('error', (err) => {
-            this.emit('error', err);
-            reject(err);
-          });
+      res.on('data', async (chunk) => {
+        if (this.aborted || this.completed) {
+          res.destroy();
+          writeStream.destroy();
+          return;
         }
-      );
+        this.downloaded += chunk.length;
+        this.emit('progress', { id: this.id, downloaded: this.downloaded, total: this.size });
 
-      req.on('error', (err) => {
+        if (this.speedLimit > 0) {
+          const delay = (chunk.length / this.speedLimit) * 1000;
+          if (delay > 2) {
+            res.pause();
+            await new Promise(r => setTimeout(r, Math.min(delay, 2000)));
+            res.resume();
+          }
+        }
+      });
+
+      res.pipe(writeStream);
+
+      writeStream.on('finish', () => {
+        this.completed = true;
+        this.emit('finished', { id: this.id, path: this.outPath });
+      });
+
+      writeStream.on('error', (err) => {
         this.emit('error', err);
-        reject(err);
       });
 
-      req.on('timeout', () => {
-        req.destroy();
-        const error = new Error('Request timeout');
-        this.emit('error', error);
-        reject(error);
+      res.on('error', (err) => {
+        this.emit('error', err);
       });
-
-      req.end();
-      this.requests.push(req);
-    });
+    } catch (err) {
+      this.emit('error', err);
+    }
   }
 
   async _runRanges() {
@@ -282,63 +373,65 @@ class DownloadTask extends EventEmitter {
 
     const nextRange = () => this.ranges.find(r => !r.done && !r.inFlight);
 
-    const startRequestFor = (range) => {
+    const startRequestFor = async (range) => {
+      if (this.aborted || this.completed) return;
       range.inFlight = true;
-      const options = {
-        method: 'GET',
-        host: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        port: urlObj.port || undefined,
-        headers: {
-          Range: `bytes=${range.start + range.downloaded}-${range.end}`,
-        },
-        // Important for YouTube direct URLs to avoid some 403s if agent varies?
-        // But usually stripped.
-      };
 
-      const req = lib.request(options, (res) => {
+      try {
+        const res = await requestWithRedirect(this.url, {
+          method: 'GET',
+          headers: {
+            'Range': `bytes=${range.start + range.downloaded}-${range.end}`,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            ...this.customHeaders
+          },
+          timeout: 120000 // 2 minutes idle timeout instead of 15 seconds
+        });
+
         if (res.statusCode >= 400) {
-          this.emit('error', new Error(`HTTP ${res.statusCode}`));
-          return;
+          throw new Error(`HTTP ${res.statusCode}`);
         }
 
-        res.on('data', async (chunk) => {
-          // write chunk at correct offset
-          res.pause();
-          const writeOffset = range.start + range.downloaded;
-          try {
+        try {
+          for await (const chunk of res) {
+            if (this.aborted || this.completed) {
+              res.destroy();
+              return;
+            }
+            
+            const writeOffset = range.start + range.downloaded;
             await this.fileHandle.write(chunk, 0, chunk.length, writeOffset);
+            
             range.downloaded += chunk.length;
             this.downloaded += chunk.length;
             this.emit('progress', { id: this.id, downloaded: this.downloaded, total: this.size });
-            res.resume();
-          } catch (err) {
-            this.emit('error', err);
-            req.destroy();
-          }
-        });
 
-        res.on('end', () => {
+            // Throttling Logic for segmented ranges
+            if (this.speedLimit > 0) {
+              const sharedLimit = this.speedLimit / this.connections;
+              const delay = (chunk.length / sharedLimit) * 1000;
+              if (delay > 2) {
+                await new Promise(r => setTimeout(r, Math.min(delay, 2000)));
+              }
+            }
+          }
+          
           range.done = range.downloaded >= (range.end - range.start + 1);
           range.inFlight = false;
           // start another range if available
           const nr = nextRange();
           if (nr) startRequestFor(nr);
           this._checkComplete();
-        });
+          
+        } catch (err) {
+          res.destroy();
+          throw err;
+        }
 
-        res.on('error', (err) => {
-          this.emit('error', err);
-        });
-      });
-
-      req.on('error', (err) => {
+      } catch (err) {
         range.inFlight = false;
         this.emit('error', err);
-      });
-
-      req.end();
-      this.requests.push(req);
+      }
     };
 
     // kick off up to connections requests
@@ -352,6 +445,7 @@ class DownloadTask extends EventEmitter {
   _checkComplete() {
     if (this.ranges.every(r => r.done)) {
       this.completed = true; // Mark completed
+      if (this.speedInterval) clearInterval(this.speedInterval);
       this.emit('finished', { id: this.id, path: this.outPath });
       if (this.fileHandle) this.fileHandle.close().catch(() => { });
       // cleanup manifest if exists
@@ -399,7 +493,7 @@ class DownloadTask extends EventEmitter {
     if (this.ranges && this.ranges.length > 0) {
       // Segmented download - resume from manifest
       if (!fs.existsSync(this.manifestPath)) {
-        this.emit('error', new Error('No manifest to resume'));
+        this.emit('error', new Error('No partial meta file found to resume'));
         return;
       }
       const manifest = JSON.parse(fs.readFileSync(this.manifestPath, 'utf-8'));
@@ -409,14 +503,30 @@ class DownloadTask extends EventEmitter {
       this.ranges = manifest.ranges;
       this.directUrl = manifest.directUrl; // Restore direct URL
       this.aborted = false;
-      this._runRanges();
+      this.completed = false;
+
+      // Calculate downloaded so far from ranges
+      this.downloaded = this.ranges.reduce((acc, r) => acc + r.downloaded, 0);
+
+      // We must reopen the file handle for random writes
+      fs.promises.open(this.outPath, 'r+').then(fd => {
+        this.fileHandle = fd;
+        this._startSpeedTicker();
+        this._runRanges();
+      }).catch(err => {
+        this.emit('error', new Error('Failed to open file for resume: ' + err.message));
+      });
+
     } else {
       // Streaming download - cannot resume, start fresh
       this.downloaded = 0;
       this.aborted = false;
+      this.completed = false;
       if (this.url.includes('youtube.com') || this.url.includes('youtu.be')) {
+        this._startSpeedTicker();
         this._startYouTubeDownload();
       } else {
+        this._startSpeedTicker();
         this._streamDownload();
       }
     }
@@ -436,12 +546,29 @@ class DownloadManager extends EventEmitter {
     super();
     this.tasks = new Map();
     this.counter = 1;
-    this.statePath = '';
+
+    // Use Advanced QueueManager
+    this.queueManager = new QueueManager(this);
+
+    this._fetchSettings();
   }
+
+  async _fetchSettings() {
+    try {
+      const res = await fetch('http://127.0.0.1:5000/api/settings');
+      if (res.ok) {
+        const data = await res.json();
+        // Sync setting to queue manager
+        this.queueManager.updateSettings(data);
+      }
+    } catch (e) {
+      console.log('[DownloadManager] API not ready to fetch settings yet. Using defaults.');
+    }
+  }
+
 
   setPersistencePath(path) {
     this.statePath = path;
-    this.loadState();
   }
 
   saveState() {
@@ -466,27 +593,38 @@ class DownloadManager extends EventEmitter {
     }
   }
 
-  loadState() {
-    if (!this.statePath || !fs.existsSync(this.statePath)) return;
+  loadState(tasksData) {
     try {
-      const data = JSON.parse(fs.readFileSync(this.statePath, 'utf-8'));
-      for (const tData of data) {
+      if (!tasksData) return;
+      for (const tData of tasksData) {
         // Reconstruct task
-        const task = new DownloadTask(tData.id, tData.url, tData.outPath, {});
-        task.size = tData.size;
-        task.downloaded = tData.downloaded;
-        task.ranges = tData.ranges || [];
-        task.aborted = tData.status === 'paused' || tData.status === 'error';
-        task.error = tData.error ? new Error(tData.error) : null;
-        task.completed = tData.completed || (tData.status === 'completed'); // restore
+        const task = new DownloadTask(tData.id, tData.url, tData.file_path || tData.filePath || tData.outPath, {});
+        task.size = tData.size || 0;
+        task.downloaded = tData.progress ? Math.floor((tData.progress / 100) * task.size) : 0;
+        task.ranges = [];
+        task.aborted = tData.status === 'paused' || tData.status === 'failed' || tData.status === 'error';
+        task.error = (tData.status === 'failed' || tData.status === 'error') ? new Error('Previous error') : null;
+        task.completed = tData.status === 'completed';
 
-        // If it was downloading, it's now paused on restore
+        // If it was downloading, it's now paused on restore unless we resume everything magically
         if (tData.status === 'downloading') task.aborted = true;
-        if (tData.status === 'error') task.error = true;
 
         this.tasks.set(task.id, task);
+
+        // Crash recovery: automatically restore unfinished downloads gracefully
+        if (tData.status === 'downloading' || tData.status === 'queued' || tData.status === 'scheduled' || tData.status === 'retrying') {
+          console.log(`[CrashRecovery] Re-queuing unfinished task: ${task.id} (Status: ${tData.status})`);
+          task.aborted = false;
+          this.queueManager.enqueue(task.id, {
+            priority: tData.priority || 'normal',
+            scheduledAt: tData.scheduledAt,
+            retryCount: tData.retryCount || 0,
+            status: tData.status
+          });
+        }
       }
-      this.counter = data.length > 0 ? Math.max(...data.map(d => parseInt(d.id.split('-').pop()) || 0)) + 1 : 1;
+      this.counter = tasksData.length > 0 ? tasksData.length + 1 : 1;
+      this.queueManager.processQueue();
     } catch (e) {
       console.error('Failed to load state:', e);
     }
@@ -499,28 +637,102 @@ class DownloadManager extends EventEmitter {
       outPath: t.outPath,
       size: t.size,
       downloaded: t.downloaded,
-      status: t.error ? 'error' : (t.aborted ? 'paused' : (t.completed ? 'completed' : 'downloading')),
+      priority: t.priority || 'normal',
+      scheduledAt: t.scheduledAt,
+      retryCount: t.retryCount || 0,
+      status: t.error ? 'error' : (t.aborted ? 'paused' : (t.completed ? 'completed' : (t.status || 'downloading'))),
     }));
   }
 
   delete(id) {
     const task = this.tasks.get(id);
     if (task) {
-      task.cancel(); // Implement cancel in DownloadTask if not fully destructive, but we want file gone too usually.
-      // Check if cancel deletes file. It does.
+      task.cancel();
+      this.queueManager.remove(id);
       this.tasks.delete(id);
-      this.saveState();
       return true;
     }
     return false;
   }
 
-  create(url, outPath, options) {
-    const id = `dl-${Date.now()}-${this.counter++}`;
-    const task = new DownloadTask(id, url, outPath, options);
-    this.tasks.set(id, task);
-    task.on('progress', (p) => { this.emit('download', { id, event: 'progress', payload: p }); this.saveState(); });
-    task.on('finished', (p) => { this.emit('download', { id, event: 'finished', payload: p }); this.saveState(); });
+  async create(url, outPath, options, id) {
+    const newId = id || `dl-${Date.now()}-${this.counter++}`;
+
+    // Use classifier to intelligently route task type
+    let meta = null;
+    try {
+      meta = await classify(url, options.headers || {});
+    } catch (e) {
+      console.warn('[DownloadManager] classify() failed, falling back to DownloadTask:', e.message);
+    }
+
+    // Allow explicit override from caller (e.g. from IPC with pre-classified data)
+    const protocol = options.protocol || (meta && meta.protocol) || 'direct';
+    const isYtdl = options.type === 'youtube' || (meta && meta.requiresYtdl);
+    const isStream = protocol === 'hls' || protocol === 'dash' || options.type === 'stream';
+
+    let task;
+    if (isStream) {
+      task = new StreamTask(newId, url, outPath, { ...options, variantUrl: options.variantUrl });
+    } else if (isYtdl) {
+      // YouTube path — use standard DownloadTask which has _startYouTubeDownload() inside
+      task = new DownloadTask(newId, url, outPath, options);
+    } else if (protocol === 'direct') {
+      // Attempt segmented download for direct files
+      task = new SegmentedDownloader(newId, url, outPath, options);
+
+      // Listen for fallback event if server doesn't support ranges
+      task.once('_fallback', async ({ reason, size }) => {
+        console.log(`[DownloadManager] SegmentedDownloader fallback (${reason}), switching to standard DownloadTask`);
+        const fallbackTask = new DownloadTask(newId, url, outPath, options);
+        fallbackTask.size = size;
+
+        // Replace the task in the map and transfer event listeners
+        this.tasks.set(newId, fallbackTask);
+        this._attachTaskListeners(fallbackTask, newId);
+
+        // Notify QueueManager of the swap if the task is already active
+        if (this.queueManager.active.has(newId)) {
+          this.queueManager.active.set(newId, fallbackTask);
+          // Reinstate handlers on the new task
+          this.queueManager._attachTaskHandlers(fallbackTask);
+          // Start the fallback
+          fallbackTask.start().catch(err => {
+            console.error(`[DownloadManager] Fallback task start failed:`, err.message);
+          });
+        }
+      });
+    } else {
+      task = new DownloadTask(newId, url, outPath, options);
+    }
+
+    // Attach resolved metadata for display purposes
+    if (meta) {
+      task.classifiedMeta = meta;
+      if (!task.size && meta.size) task.size = meta.size;
+    }
+
+    this.tasks.set(newId, task);
+    this._attachTaskListeners(task, newId);
+
+    // Enter advanced queue instead of auto-starting
+    this.queueManager.enqueue(newId, options);
+
+    return task;
+  }
+
+  /**
+   * Helper to attach all necessary event listeners to a task.
+   */
+  _attachTaskListeners(task, id) {
+    task.on('progress', (p) => {
+      this.emit('download', { id, event: 'progress', payload: p });
+      this.saveState();
+    });
+    task.on('finished', (p) => {
+      this.emit('download', { id, event: 'finished', payload: p });
+      this.saveState();
+    });
     task.on('error', (e) => {
       task.error = e;
       this.emit('download', { id, event: 'error', payload: { message: e.message } });
@@ -531,10 +743,39 @@ class DownloadManager extends EventEmitter {
       this.emit('download', { id, event: 'started', payload: p });
       this.saveState();
     });
-    task.on('paused', () => { this.emit('download', { id, event: 'paused' }); this.saveState(); });
-    task.on('resumed', (p) => { this.emit('download', { id, event: 'resumed', payload: p }); this.saveState(); });
-    task.on('cancelled', (p) => { this.emit('download', { id, event: 'cancelled', payload: p }); this.saveState(); });
-    return task;
+    task.on('paused', () => {
+      this.emit('download', { id, event: 'paused' });
+      this.saveState();
+    });
+    task.on('resumed', (p) => {
+      this.emit('download', { id, event: 'resumed', payload: p });
+      this.saveState();
+    });
+    task.on('cancelled', (p) => {
+      this.emit('download', { id, event: 'cancelled', payload: p });
+      this.saveState();
+    });
+    task.on('merging', (p) => {
+      this.emit('download', { id, event: 'merging', payload: p });
+    });
+    task.on('live-stream', () => {
+      this.emit('download', { id, event: 'error', payload: { message: 'Live streams are not supported.' } });
+    });
+  }
+
+  /**
+   * Stop and remove a task completely
+   */
+  delete(id) {
+    console.log(`[DownloadManager] Deleting task: ${id}`);
+    const task = this.tasks.get(id);
+    if (task) {
+      if (task.pause) task.pause();
+      this.tasks.delete(id);
+    }
+    this.queueManager.remove(id);
+    this.saveState();
+    return true;
   }
 }
 

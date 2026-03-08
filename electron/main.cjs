@@ -8,11 +8,31 @@ try {
   console.error("Failed to polyfill File:", e);
 }
 
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const electron = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = electron;
+
+if (!app) {
+  // Try to fallback to dummy app or log more info
+  console.error('[Electron] Error: `app` is undefined. Environment:', {
+    ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE,
+    ELECTRON_NO_ASAR: process.env.ELECTRON_NO_ASAR,
+    nodeVersion: process.version,
+    electronVersion: process.versions.electron
+  });
+  // Only exit if not in some weird recovery mode
+  if (process.versions.electron) {
+    console.warn('[Electron] Running in Electron but app is missing? Proceeding with caution.');
+  } else {
+    process.exit(1);
+  }
+}
 const path = require('path');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const http = require('http');
 const { URL } = require('url');
+const WebSocket = require('ws');
+const { exec } = require('child_process');
 
 console.log('[Electron] Starting app...');
 
@@ -23,10 +43,204 @@ let mainWindow = null;
 const { DownloadManager } = require('./downloader.cjs');
 const dm = new DownloadManager();
 
-// Forward download events to renderer
+/**
+ * Super Overkill: Native Messaging Registry Setup
+ */
+function registerNativeHost() {
+  const hostPath = path.join(__dirname, 'native-messaging', 'host-manifest.json');
+  const chromeRegKey = 'HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.nexus.manager.host';
+  const edgeRegKey = 'HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\com.nexus.manager.host';
+
+  // Chrome
+  exec(`reg add "${chromeRegKey}" /ve /t REG_SZ /d "${hostPath}" /f`, (err) => {
+    if (err) console.error('[Registry] Failed to register Chrome host:', err);
+    else console.log('[Registry] Chrome Native Host registered.');
+  });
+
+  // Edge
+  exec(`reg add "${edgeRegKey}" /ve /t REG_SZ /d "${hostPath}" /f`, (err) => {
+    if (err) console.error('[Registry] Failed to register Edge host:', err);
+    else console.log('[Registry] Edge Native Host registered.');
+  });
+}
+
+/**
+ * Super Overkill: Bridge Server
+ */
+function startBridgeServer() {
+  const wss = new WebSocket.Server({ port: 8989 });
+  wss.on('connection', (ws) => {
+    ws.on('message', (message) => {
+      try {
+        const data = JSON.parse(message);
+        if (data.type === 'DOWNLOAD_SNIFFED') {
+          showNewDownloadDialog('browser', data.payload.url, data.payload.headers);
+        } else if (data.type === 'REGISTER_EXTENSION') {
+          // Dynamically rewrite the host manifest to allow the current extension ID
+          const extId = data.id;
+          if (extId && extId.length === 32) {
+            const hostManifestPath = path.join(__dirname, 'native-messaging', 'host-manifest.json');
+            try {
+              if (fs.existsSync(hostManifestPath)) {
+                const manifest = JSON.parse(fs.readFileSync(hostManifestPath, 'utf8'));
+                const newOrigin = `chrome-extension://${extId}/`;
+                if (!manifest.allowed_origins.includes(newOrigin)) {
+                  manifest.allowed_origins = [newOrigin];
+                  fs.writeFileSync(hostManifestPath, JSON.stringify(manifest, null, 2));
+                  console.log(`[Bridge] Dynamically registered extension ID: ${extId}`);
+                }
+              }
+            } catch (err) {
+              console.error('[Bridge] Failed to update host manifest:', err);
+            }
+          }
+        }
+      } catch (e) { }
+    });
+  });
+}
+
+/**
+ * Phase 8: HTTP Intercept Server
+ * Listens for automatic browser interceptions on port 4578.
+ */
+// Global cache for captured request headers (Auth/Cookies) 
+const capturedHeaders = new Map();
+
+function startInterceptServer() {
+  const server = http.createServer((req, res) => {
+    // Enable CORS for extension
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(200);
+      return res.end();
+    }
+
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', async () => {
+      try {
+        const data = body ? JSON.parse(body) : {};
+
+        if (req.method === 'POST' && req.url === '/intercept') {
+          console.log('[Intercept] Link Intercepted:', data.url, 'Source:', data.source);
+          showNewDownloadDialog(data.source || 'browser-capture', data.url, {
+            referer: data.referrer,
+            'User-Agent': data.userAgent,
+            Cookie: data.cookies,
+            ...data
+          });
+        }
+        else if (req.method === 'POST' && req.url === '/media-detected') {
+          // Log only; passive detection should not interrupt the user with a modal
+          console.log('[Media] Stream Detected (Passive):', data.url);
+          // Optional: Send to main window only (not a modal)
+          if (mainWindow && mainWindow.webContents) {
+            mainWindow.webContents.send('stream-detected-passive', data);
+          }
+        }
+        else if (req.method === 'POST' && req.url === '/capture-headers') {
+          console.log('[Intercept] Headers Captured for:', data.url);
+          if (data.url && data.headers) {
+            capturedHeaders.set(data.url, data.headers);
+            // Expiry after 10 mins
+            setTimeout(() => capturedHeaders.delete(data.url), 600000);
+          }
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400);
+        res.end('Invalid Request');
+      }
+    });
+  });
+
+  server.listen(4578, '127.0.0.1', () => {
+    console.log('[Intercept] Listening for browser extension on port 4578');
+  });
+}
+
+function showNewDownloadDialog(source, url, meta = {}) {
+  const headers = meta.headers || {};
+  console.log(`[Bridge] Opening Dialog for ${source}:`, url);
+
+  const dialogWindow = new BrowserWindow({
+    width: 1000,
+    height: 750,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    alwaysOnTop: true,
+    center: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  const baseUrl = process.env.NODE_ENV === 'production'
+    ? `file://${path.join(__dirname, '..', 'client', 'dist', 'index.html')}`
+    : 'http://localhost:5000'; // Ensure correct vite port
+
+  const dialogUrl = `${baseUrl}?dialog=true`;
+  dialogWindow.loadURL(dialogUrl);
+
+  dialogWindow.once('ready-to-show', () => {
+    dialogWindow.show();
+  });
+
+  dialogWindow.webContents.on('did-finish-load', () => {
+    dialogWindow.webContents.send('download-detected', source, url, headers, meta);
+  });
+
+  // Self-closing on IPC
+  ipcMain.once('dialog/close', () => {
+    if (!dialogWindow.isDestroyed()) dialogWindow.close();
+  });
+}
+
+// Forward download events to renderer and sync DB
 dm.on('download', ({ id, event, payload }) => {
   if (mainWindow && mainWindow.webContents) {
     mainWindow.webContents.send(`download/${event}`, { id, ...payload });
+  }
+
+  let updateData = {};
+  if (event === 'started') {
+    updateData = { status: 'downloading', size: payload.size };
+  } else if (event === 'progress') {
+    updateData = {
+      progress: payload.total ? Math.min(100, Math.round((payload.downloaded / payload.total) * 100)) : 0,
+      speed: payload.speed || 0,
+      size: payload.total || 0,
+    };
+  } else if (event === 'finished') {
+    updateData = { status: 'completed', progress: 100, speed: 0 };
+  } else if (event === 'error') {
+    updateData = { status: 'failed', speed: 0 };
+  } else if (event === 'paused') {
+    updateData = { status: 'paused', speed: 0 };
+  } else if (event === 'resumed') {
+    updateData = { status: 'downloading' };
+  } else if (event === 'cancelled') {
+    updateData = { status: 'cancelled', speed: 0 };
+  }
+
+  if (Object.keys(updateData).length > 0) {
+    const url = 'http://127.0.0.1:5000/api/downloads/' + id;
+    fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updateData)
+    }).catch(e => console.error('[Database sync error]', e.message));
   }
 });
 
@@ -94,6 +308,12 @@ async function createWindow() {
   });
 
   if (process.env.NODE_ENV === 'production') {
+    try {
+      const res = await fetch('http://127.0.0.1:5000/api/downloads');
+      const dls = await res.json();
+      dm.loadState(dls);
+    } catch (e) { console.error('Failed to load DB states', e.message); }
+
     const indexPath = path.join(__dirname, '..', 'client', 'dist', 'index.html');
     console.log('[Electron] Loading production file:', indexPath);
     mainWindow.loadFile(indexPath);
@@ -102,6 +322,12 @@ async function createWindow() {
     console.log('[Electron] Waiting for dev server at', url);
     try {
       await waitForServer(url, 30000);
+      try {
+        const res = await fetch('http://127.0.0.1:5000/api/downloads');
+        const dls = await res.json();
+        dm.loadState(dls);
+      } catch (e) { console.error('Failed to load DB states', e.message); }
+
       console.log('[Electron] Dev server is ready, loading URL');
       mainWindow.loadURL(url);
     } catch (err) {
@@ -118,13 +344,32 @@ async function createWindow() {
 }
 
 app.on('ready', async () => {
+  // Overkill Setup - Start these IMMEDIATELY to listen for the browser
+  startBridgeServer();
+  startInterceptServer();
+  registerNativeHost();
+
   console.log('[Electron] App ready event fired');
+
   if (process.env.NODE_ENV !== 'production') {
     console.log('[Electron] Starting dev server...');
     startDevServer();
     // Give server a moment to start
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r => setTimeout(r, 2000));
   }
+
+  // Load existing downloads from DB into Memory
+  try {
+    const res = await fetch('http://127.0.0.1:5000/api/downloads');
+    if (res.ok) {
+      const tasks = await res.json();
+      console.log(`[Electron] Restoring ${tasks.length} tasks from DB...`);
+      dm.loadState(tasks);
+    }
+  } catch (err) {
+    console.warn('[Electron] Could not restore tasks from DB (Server not ready?):', err.message);
+  }
+
   try {
     await createWindow();
     console.log('[Electron] Window created successfully');
@@ -160,32 +405,45 @@ setInterval(() => {
       // Validate URL object
       try {
         new URL(text);
-        if (mainWindow && mainWindow.webContents) {
-          console.log('[Clipboard] URL detected:', text);
-          mainWindow.webContents.send('download-detected', text);
-        }
+        console.log('[Clipboard] URL detected:', text);
+        showNewDownloadDialog('clipboard', text);
       } catch (e) { }
     }
   }
 }, 1000);
 
-// Initialize persistence
-const userDataPath = app.getPath('userData');
-const downloadsStatePath = path.join(userDataPath, 'downloads.json');
-console.log('[Electron] Downloads state path:', downloadsStatePath);
-dm.setPersistencePath(downloadsStatePath);
+// Initialization of persistence is now handled by API load.
 
 // IPC Handlers - Real download integration
+ipcMain.on('dialog/close', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) win.close();
+});
+
+ipcMain.handle('app/quit', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) win.close();
+  return true;
+});
+
 ipcMain.handle('download/delete', async (_event, id) => {
-  return dm.delete(id);
+  const result = dm.delete(id);
+  if (result) {
+    try {
+      await fetch('http://127.0.0.1:5000/api/downloads/' + id, { method: 'DELETE' });
+    } catch (e) { }
+  }
+  return result;
 });
 
 ipcMain.handle('open/file', async (_event, filePath) => {
   if (!filePath) return false;
   try {
-    await shell.openPath(filePath);
+    const absolutePath = path.resolve(filePath);
+    await shell.openPath(absolutePath);
     return true;
   } catch (e) {
+    console.error('[Open] Failed to open file:', filePath, e);
     return false;
   }
 });
@@ -193,15 +451,93 @@ ipcMain.handle('open/file', async (_event, filePath) => {
 ipcMain.handle('open/folder', async (_event, filePath) => {
   if (!filePath) return false;
   try {
-    await shell.showItemInFolder(filePath);
+    const absolutePath = path.resolve(filePath);
+    await shell.showItemInFolder(absolutePath);
     return true;
   } catch (e) {
+    console.error('[Open] Failed to show folder:', filePath, e);
     return false;
   }
 });
 
 ipcMain.handle('download/list', async () => {
-  return dm.getAllTasks(); // You'll need to implement a detailed GetAllTasks if the basic one isn't enough, but the array mapping in downloader.cjs covered it.
+  return dm.getAllTasks();
+});
+
+ipcMain.handle('download/move-up', async (_event, id) => {
+  dm.queueManager.moveUp(id);
+  return { ok: true };
+});
+
+ipcMain.handle('download/move-down', async (_event, id) => {
+  dm.queueManager.moveDown(id);
+  return { ok: true };
+});
+
+ipcMain.handle('download/update-priority', async (_event, id, priority) => {
+  const task = dm.tasks.get(id);
+  if (task) {
+    task.priority = priority;
+    // If it's in waiting, re-sort
+    dm.queueManager._sortWaiting();
+    return { ok: true };
+  }
+  return { ok: false };
+});
+
+ipcMain.handle('dialog/select-folder', async () => {
+  const { dialog } = require('electron');
+  const result = await dialog.showOpenDialog({
+    properties: ['openDirectory', 'createDirectory']
+  });
+  if (result.canceled) return null;
+  return result.filePaths[0];
+});
+
+// Stream quality inspection IPC
+const { inspectHLSPlaylist, inspectDASHManifest } = require('./stream-downloader.cjs');
+const { classify } = require('./url-classifier.cjs');
+
+ipcMain.handle('stream/get-info', async (_event, url, headers = {}) => {
+  try {
+    const isHLS = url.includes('.m3u8') || url.includes('m3u8?');
+    const isDASH = url.includes('.mpd') || url.includes('mpd?');
+
+    if (isHLS) {
+      const info = await inspectHLSPlaylist(url, headers);
+      return { ok: true, protocol: 'hls', ...info };
+    } else if (isDASH) {
+      const info = await inspectDASHManifest(url, headers);
+      return { ok: true, protocol: 'dash', ...info };
+    } else {
+      return { ok: false, message: 'Not a recognized streaming URL' };
+    }
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+});
+
+// URL Classifier IPC — used by React UI to pre-populate download dialog
+ipcMain.handle('url/classify', async (_event, url, headers = {}) => {
+  try {
+    const meta = await classify(url, headers);
+    return { ok: true, ...meta };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+});
+
+// Media Analyzer IPC — returns full quality options for quality selector UI
+const { analyzeMedia } = require('./media-analyzer.cjs');
+
+ipcMain.handle('media/analyze', async (_event, url, classification = null, headers = {}) => {
+  try {
+    const result = await analyzeMedia(url, classification, headers);
+    return { ok: true, ...result };
+  } catch (e) {
+    console.error('[IPC] media/analyze failed:', e.message);
+    return { ok: false, message: e.message };
+  }
 });
 
 const { MediaExtractor } = require('./media-extractor.cjs');
@@ -213,43 +549,53 @@ ipcMain.handle('youtube/get-info', async (_event, url) => {
     const { spawn } = require('child_process');
     const ytpPath = path.join(__dirname, '..', 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp.exe');
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const subprocess = spawn(ytpPath, [
         url,
         '--dump-json',
         '--no-warnings',
-        '--prefer-free-formats',
+        '--flat-playlist',
+        '--no-check-certificate',
+        '--no-call-home',
+        '--socket-timeout', '10',
         '--add-header', 'referer:youtube.com',
-        '--add-header', 'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        '--add-header', 'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
       ]);
 
       let stdout = '';
       let stderr = '';
 
+      const timeout = setTimeout(() => {
+        subprocess.kill();
+        resolve({ ok: false, message: 'Metadata fetch timed out' });
+      }, 15000);
+
       subprocess.stdout.on('data', (data) => stdout += data.toString());
       subprocess.stderr.on('data', (data) => stderr += data.toString());
 
       subprocess.on('close', (code) => {
+        clearTimeout(timeout);
         if (code === 0) {
           try {
             const info = JSON.parse(stdout);
             const title = info.title;
-            const resolutions = [...new Set(info.formats
+            // Extract resolutions safely
+            const formats = info.formats || [];
+            const resolutions = [...new Set(formats
               .filter(f => f.vcodec !== 'none' && f.height)
               .map(f => f.height))]
               .sort((a, b) => b - a);
 
-            resolve({ ok: true, title, resolutions });
+            resolve({ ok: true, title, resolutions: resolutions.length > 0 ? resolutions : [1080, 720, 480, 360] });
           } catch (e) {
-            reject(new Error('Failed to parse YouTube metadata'));
+            resolve({ ok: false, message: 'Parse error' });
           }
         } else {
-          reject(new Error(stderr || `yt-dlp exited with code ${code}`));
+          resolve({ ok: false, message: stderr || `Exit ${code}` });
         }
       });
     });
   } catch (err) {
-    console.error('[IPC] Failed to get YouTube info:', err);
     return { ok: false, message: err.message };
   }
 });
@@ -261,30 +607,91 @@ ipcMain.handle('download/start', async (_event, url, options = {}) => {
       return { ok: false, message: 'Invalid URL' };
     }
 
-    // Use original title if provided by frontend from metadata
-    let filename = options.title ? `${options.title}.mp4` : MediaExtractor.getFilename(url);
+    // Use original title or custom filename if provided by frontend
+    let filename = options.filename;
+
+    // Enforce extensions if missing
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      if (options.isAudioOnly || options.quality === 'audio') {
+        if (!filename.toLowerCase().endsWith('.mp3')) {
+          filename += ".mp3";
+        }
+      } else if (!filename.toLowerCase().endsWith('.mp4')) {
+        filename += ".mp4";
+      }
+    } else if (!filename.includes('.')) {
+      filename += '.zip';
+    }
+
+    // Inject captured headers if available
+    if (capturedHeaders.has(url)) {
+      console.log('[Capture] Injecting headers for:', url);
+      options.headers = { ...capturedHeaders.get(url), ...options.headers };
+    }
 
     // Sanitize filename
-    filename = filename.replace(/[<>:"|?*]/g, '_');
+    filename = filename.replace(/[<>:"|\\?*]/g, '_');
 
-    // Save to downloads folder
-    const outPath = path.join(app.getPath('downloads'), filename);
+    // Save to downloads folder or custom path
+    const downloadsFolder = app.getPath('downloads');
+    const outPath = options.savePath ? path.join(options.savePath, filename) : path.join(downloadsFolder, filename);
+
+    // Save to DB first
+    let dbId;
+    try {
+      const { randomUUID } = require('crypto');
+      const res = await fetch('http://127.0.0.1:5000/api/downloads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: randomUUID(),
+          url,
+          filename,
+          filePath: outPath,
+          status: 'queued',
+          progress: 0,
+          size: 0
+        })
+      });
+      if (!res.ok) throw new Error('API Response not ok');
+      const dbRow = await res.json();
+      dbId = dbRow.id;
+    } catch (err) {
+      console.error('[IPC] Failed to save DB record:', err.message);
+      dbId = undefined; // Will fallback to local ID generated in downloader
+    }
 
     // Create and start download task with quality options
-    const task = dm.create(url, outPath, {
-      connections: 6,
+    const task = await dm.create(url, outPath, {
+      connections: options.connections || 8,
       resolution: options.quality,
-      title: options.title
-    });
+      title: options.title,
+      type: options.type,
+      protocol: options.protocol,
+      isAudioOnly: options.isAudioOnly || options.quality === 'audio',
+      headers: options.headers || {}
+    }, dbId);
+
+    // Notify main window immediately so it shows up in the list
+    if (mainWindow && mainWindow.webContents) {
+      mainWindow.webContents.send('download/created', {
+        id: task.id,
+        name: filename,
+        url: url,
+        status: task.status,
+        progress: 0,
+        size: task.size,
+        outPath: outPath,
+        dateAdded: new Date().toISOString().split('T')[0]
+      });
+    }
 
     try {
-      await task.start();
-      console.log('[IPC] Download started with ID:', task.id);
-      dm.saveState(); // Save state immediately
-      return { ok: true, id: task.id, outPath, filename, size: task.size };
+      console.log('[IPC] Download queued with ID:', task.id);
+      return { ok: true, id: task.id, outPath, filename, size: task.size || 0 };
     } catch (err) {
-      console.error('[IPC] Failed to start download:', err.message);
-      return { ok: false, message: err.message || 'Failed to start download' };
+      console.error('[IPC] Failed to queue download:', err.message);
+      return { ok: false, message: err.message || 'Failed to queue download' };
     }
   } catch (err) {
     console.error('[IPC] Download start error:', err);

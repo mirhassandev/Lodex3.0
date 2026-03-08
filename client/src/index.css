@@ -84,6 +84,12 @@
       linear-gradient(to bottom, hsl(220 20% 10%), hsl(220 20% 8%));
     min-height: 100vh;
   }
+
+  .dialog-mode, .dialog-mode body {
+    background: transparent !important;
+    background-image: none !important;
+    overflow: hidden;
+  }
   
   /* Scrollbar styling for that native app feel */
   ::-webkit-scrollbar {

@@ -1,6 +1,6 @@
 import { Video, Music, FileText, Archive, Play, Pause, X, RotateCw, MonitorPlay, FolderOpen } from "lucide-react";
 
-export type DownloadStatus = "downloading" | "paused" | "error" | "completed" | "queued";
+export type DownloadStatus = "downloading" | "paused" | "error" | "completed" | "queued" | "scheduled" | "retrying";
 export type FileType = "video" | "audio" | "document" | "archive" | "other";
 
 export interface DownloadItem {
@@ -12,11 +12,18 @@ export interface DownloadItem {
   progress: number; // 0-100
   speed: string; // e.g., "2.4 MB/s"
   status: DownloadStatus;
+  priority: "high" | "normal" | "low";
   type: FileType;
   url: string;
   eta: string;
   dateAdded: string;
+  retryCount?: number;
+  scheduledAt?: number;
   outPath?: string;
+  connections?: number;
+  segmentsDone?: number;
+  segmentsTotal?: number;
+  merging?: boolean;
 }
 
 export const mockDownloads: DownloadItem[] = [];

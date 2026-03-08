@@ -1,0 +1,10 @@
+{
+    "name": "com.nexus.manager.host",
+    "description": "Nexus Manager Native Messaging Host",
+    "path": "nexus-bridge.bat",
+    "type": "stdio",
+    "allowed_origins": [
+        "chrome-extension://hfdfmgmbfpckihpijmjdghbkmgnobghl/",
+        "chrome-extension://*"
+    ]
+}

@@ -1,12 +1,12 @@
 import React, { useState } from "react";
-import { 
-  Calendar, 
-  Globe, 
-  ArrowDownToLine, 
-  Clock, 
-  Settings2, 
-  Shield, 
-  Zap, 
+import {
+  Calendar,
+  Globe,
+  ArrowDownToLine,
+  Clock,
+  Settings2,
+  Shield,
+  Zap,
   Network,
   History,
   MousePointer2,
@@ -32,9 +32,11 @@ interface AdvancedToolsModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   initialTab?: string;
+  settings?: any;
+  onSettingsChange?: (update: any) => void;
 }
 
-export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler" }: AdvancedToolsModalProps) {
+export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler", settings, onSettingsChange }: AdvancedToolsModalProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[700px] h-[600px] flex flex-col p-0 overflow-hidden bg-card border-border/50">
@@ -47,7 +49,7 @@ export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler
             Configure scheduling, network proxies, and browser automation settings.
           </DialogDescription>
         </DialogHeader>
-        
+
         <Tabs defaultValue={initialTab} className="flex-1 flex flex-col min-h-0">
           <div className="px-6 border-b">
             <TabsList className="bg-transparent h-12 gap-6 p-0">
@@ -199,7 +201,14 @@ export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler
                           <span className="font-medium">{browser.name}</span>
                           <span className="text-xs text-muted-foreground">Version {browser.version}</span>
                         </div>
-                        <Switch defaultChecked={browser.status === "Enabled"} />
+                        <Switch
+                          checked={browser.status === "Enabled" ? (settings?.browserIntegration ?? true) : false}
+                          onCheckedChange={(checked) => {
+                            if (browser.status === "Enabled" && onSettingsChange) {
+                              onSettingsChange({ browserIntegration: checked });
+                            }
+                          }}
+                        />
                       </div>
                     ))}
                   </div>
@@ -240,7 +249,7 @@ export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler
                           </div>
                         </div>
                       </div>
-                      
+
                       <div className="flex items-center gap-2 p-3 rounded-lg bg-primary/5 border border-primary/10">
                         <Lock className="w-4 h-4 text-primary shrink-0" />
                         <p className="text-xs text-muted-foreground">
@@ -253,7 +262,10 @@ export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler
                           <Label>Use System Credentials (SSO)</Label>
                           <p className="text-[10px] text-muted-foreground">Automatically log in using current Windows/macOS user session.</p>
                         </div>
-                        <Switch defaultChecked />
+                        <Switch
+                          checked={settings?.autoCaptureDownloads ?? true}
+                          onCheckedChange={(checked) => onSettingsChange && onSettingsChange({ autoCaptureDownloads: checked })}
+                        />
                       </div>
                     </CardContent>
                   </Card>
@@ -281,7 +293,7 @@ export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler
                     <h4 className="font-semibold">Active Queues</h4>
                     <Button size="sm" variant="ghost" className="text-primary">+ New Queue</Button>
                   </div>
-                  
+
                   <div className="space-y-3">
                     {[
                       { name: "Main Queue", items: 12, speed: "Unlimited", color: "bg-green-500" },
@@ -311,7 +323,7 @@ export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler
               </TabsContent>
             </div>
           </ScrollArea>
-          
+
           <DialogFooter className="p-6 border-t bg-secondary/10">
             <Button variant="ghost" onClick={() => onOpenChange(false)}>Cancel</Button>
             <Button className="bg-primary hover:bg-primary/90" onClick={() => onOpenChange(false)}>Save Changes</Button>
