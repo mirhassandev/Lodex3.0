@@ -294,6 +294,7 @@ class SegmentedDownloader extends EventEmitter {
                     segmentsTotal: this.segments.length,
                     connections: this.connections,
                     merging: true,
+                    outPath: this.outPath
                 });
             });
 
@@ -341,6 +342,7 @@ class SegmentedDownloader extends EventEmitter {
                 segmentsTotal: this.segments.length,
                 connections: this.connections,
                 merging: false,
+                outPath: this.outPath
             });
         }, 1000);
     }

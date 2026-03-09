@@ -41,6 +41,7 @@ interface NewDownloadDialogProps {
     size?: number;
     headers?: Record<string, string>;
     meta?: any;
+    defaultSavePath?: string;
     onConfirm: (options: any) => void;
     onCancel: () => void;
 }
@@ -55,9 +56,9 @@ function formatFileSize(bytes?: number): string {
     return `${kb.toFixed(0)} KB`;
 }
 
-export function NewDownloadDialog({ url, filename: initialFilename, size, headers, meta, onConfirm, onCancel }: NewDownloadDialogProps) {
+export function NewDownloadDialog({ url, filename: initialFilename, size, headers, meta, defaultSavePath, onConfirm, onCancel }: NewDownloadDialogProps) {
     const [filename, setFilename] = useState(initialFilename || "downloaded_file");
-    const [savePath, setSavePath] = useState("C:\\Users\\themi\\Downloads");
+    const [savePath, setSavePath] = useState(defaultSavePath || "C:\\Downloads");
     const [isSpeedBoost, setIsSpeedBoost] = useState(true);
     const [isLoading, setIsLoading] = useState(false);
     const [analyzeError, setAnalyzeError] = useState<string | null>(null);
@@ -66,6 +67,7 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
     const [isAudioOnly, setIsAudioOnly] = useState(!!meta?.isAudioOnly);
     const [scheduledAt, setScheduledAt] = useState<string>('');
     const [copied, setCopied] = useState(false);
+    const [scheduledConfirmed, setScheduledConfirmed] = useState(false);
 
     const dragControls = useDragControls();
     const electronAPI = (window as any).electronAPI;
@@ -99,9 +101,8 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
 
         electronAPI.analyzeMedia(url, meta || null, headers)
             .then((result: MediaAnalysis) => {
-                if (!result.ok && result.error) {
+                if (result.error) {
                     setAnalyzeError(result.error);
-                    return;
                 }
                 setMedia(result);
 
@@ -154,6 +155,18 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
     ) || displayOptions[0];
 
     const handleConfirm = (mode: 'now' | 'later') => {
+        if (mode === 'later') {
+            if (!scheduledAt) {
+                toast.error('Please set a schedule date/time first using the "Schedule Start" field above.');
+                return;
+            }
+            const scheduledMs = new Date(scheduledAt).getTime();
+            if (scheduledMs <= Date.now()) {
+                toast.error('Scheduled time must be in the future.');
+                return;
+            }
+        }
+
         onConfirm({
             filename,
             savePath,
@@ -169,7 +182,88 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
             status: mode === 'later' ? 'scheduled' : 'queued',
             headers: headers
         });
+
+        if (mode === 'later') {
+            setScheduledConfirmed(true);
+        }
     };
+
+    // ── Scheduled Confirmation Screen ───────────────────────────────────────
+    if (scheduledConfirmed) {
+        const scheduledDate = scheduledAt ? new Date(scheduledAt) : null;
+        return (
+            <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="bg-[#0b0f1a] w-full h-full rounded-3xl overflow-hidden border border-white/10 shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)] flex flex-col"
+            >
+                {/* Header */}
+                <div style={{ WebkitAppRegion: 'drag' } as any} className="h-12 flex items-center px-4 shrink-0 border-b border-white/5 bg-[#0d1321]">
+                    <div className="flex gap-2 mr-6" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                        <button onClick={onCancel} className="w-3 h-3 rounded-full bg-[#ff5f57] hover:bg-[#ff5f57cc] border border-[#e0443e] transition-colors" title="Close" />
+                        <button onClick={() => electronAPI?.minimize?.()} className="w-3 h-3 rounded-full bg-[#febc2e] hover:bg-[#febc2ecc] border border-[#d8a120] transition-colors" title="Minimize" />
+                        <div className="w-3 h-3 rounded-full bg-[#28c840] opacity-50 border border-[#24a02e]" />
+                    </div>
+                    <div className="flex items-center gap-3">
+                        <div className="bg-purple-600/20 p-2 rounded-xl border border-purple-500/20">
+                            <Clock className="w-4 h-4 text-purple-400" />
+                        </div>
+                        <div>
+                            <h2 className="text-sm font-bold text-white">Nexus Engine</h2>
+                            <p className="text-[10px] text-purple-400 uppercase font-black tracking-widest opacity-70">Download Scheduled</p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Content */}
+                <div className="flex-1 flex flex-col items-center justify-center p-8 space-y-6">
+                    <motion.div
+                        initial={{ scale: 0 }}
+                        animate={{ scale: 1 }}
+                        transition={{ type: "spring", delay: 0.1 }}
+                        className="w-20 h-20 rounded-2xl bg-purple-600/20 border border-purple-500/30 flex items-center justify-center"
+                    >
+                        <Clock className="w-10 h-10 text-purple-400" />
+                    </motion.div>
+
+                    <div className="text-center space-y-2">
+                        <h3 className="text-xl font-black text-white">Download Scheduled!</h3>
+                        <p className="text-white/50 text-sm">Your download has been queued and will start automatically.</p>
+                    </div>
+
+                    <div className="w-full bg-white/[0.03] border border-white/5 rounded-2xl p-5 space-y-3">
+                        <div className="flex items-start gap-3">
+                            <div className="text-[9px] text-white/30 uppercase font-black tracking-widest w-24 shrink-0 mt-0.5">File</div>
+                            <p className="text-white text-sm font-bold truncate">{filename}</p>
+                        </div>
+                        <div className="h-px bg-white/5" />
+                        <div className="flex items-center gap-3">
+                            <div className="text-[9px] text-white/30 uppercase font-black tracking-widest w-24 shrink-0">Starts At</div>
+                            <p className="text-purple-400 text-sm font-black">
+                                {scheduledDate ? scheduledDate.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'Unknown'}
+                            </p>
+                        </div>
+                        <div className="h-px bg-white/5" />
+                        <div className="flex items-center gap-3">
+                            <div className="text-[9px] text-white/30 uppercase font-black tracking-widest w-24 shrink-0">Save To</div>
+                            <p className="text-white/60 text-xs font-mono truncate">{savePath}</p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Footer */}
+                <div className="p-4 bg-[#0f172a] border-t border-white/5 flex gap-3 shrink-0">
+                    <Button
+                        className="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-bold h-10 rounded-lg gap-2 shadow-lg transition-all text-xs"
+                        onClick={onCancel}
+                    >
+                        <Check className="w-4 h-4" />
+                        Done
+                    </Button>
+                </div>
+            </motion.div>
+        );
+    }
 
     return (
         <motion.div
@@ -178,50 +272,63 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
             className="bg-[#0b0f1a] w-full h-full rounded-3xl overflow-hidden border border-white/10 shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)] flex flex-col"
         >
 
-                {/* ── Draggable Header ────────────────────────────────────────────────── */}
+                {/* ── Header ────────────────────────────────────────────────────────── */}
                 <div 
                     style={{ WebkitAppRegion: 'drag' } as any}
-                    className="bg-gradient-to-r from-[#1e293b] to-[#0f172a] p-6 border-b border-white/5 flex justify-between items-center relative shrink-0"
+                    className="h-10 flex items-center px-4 relative shrink-0 border-b border-white/5 bg-[#0d1321]"
                 >
-                    <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-blue-500 to-transparent opacity-50" />
-                    <div className="flex items-center gap-4">
-                        <div className="bg-blue-600/20 p-3 rounded-2xl border border-blue-500/20 shadow-inner">
+                    {/* macOS Window Controls */}
+                    <div className="flex gap-2 mr-6" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                        <button 
+                            onClick={() => electronAPI?.close()}
+                            className="w-3 h-3 rounded-full bg-[#ff5f57] hover:bg-[#ff5f57cc] border border-[#e0443e] transition-colors"
+                            title="Close"
+                        />
+                        <button 
+                            onClick={() => electronAPI?.minimize()}
+                            className="w-3 h-3 rounded-full bg-[#febc2e] hover:bg-[#febc2ecc] border border-[#d8a120] transition-colors"
+                            title="Minimize"
+                        />
+                        <div className="w-3 h-3 rounded-full bg-[#28c840] opacity-50 border border-[#24a02e]" />
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                        <div className="bg-blue-600/20 p-2 rounded-xl border border-blue-500/20">
                             {isLoading
-                                ? <Loader2 className="w-5 h-5 text-blue-400 animate-spin" />
-                                : <Download className="w-5 h-5 text-blue-400" />}
+                                ? <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                                : <Download className="w-4 h-4 text-blue-400" />}
                         </div>
-                        <div>
-                            <h2 className="text-xl font-black text-white leading-tight tracking-tight">New Download</h2>
-                            <p className="text-[10px] text-blue-400 uppercase tracking-widest font-black opacity-70">Nexus Intelligence Engine</p>
+                        <div className="flex flex-col">
+                            <h2 className="text-sm font-bold text-white tracking-wide">Nexus Manager</h2>
+                            <p className="text-[10px] text-blue-400 uppercase font-black tracking-widest opacity-70">Intelligence Engine</p>
                         </div>
                     </div>
-                    <Button variant="ghost" size="icon" onClick={onCancel}
-                        style={{ WebkitAppRegion: 'no-drag' } as any}
-                        className="text-muted-foreground hover:text-white hover:bg-white/5 rounded-2xl h-10 w-10 transition-all border border-transparent hover:border-white/10">
-                        <X className="w-5 h-5" />
-                    </Button>
+
+                    <div className="ml-auto flex items-center gap-4">
+                        <span className="text-[10px] text-white/30 font-bold uppercase tracking-widest">v1.2.0</span>
+                    </div>
                 </div>
 
                 {/* ── Main Scrollable Content ────────────────────────────────────────── */}
                 <div className="flex-1 overflow-y-auto custom-scrollbar">
-                    <div className="p-8 space-y-8">
+                    <div className="p-4 space-y-4">
 
                         {/* Top Section: Media Info + Source URL */}
-                        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+                        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
                             {/* Media Card */}
-                            <div className="lg:col-span-12 flex gap-6 bg-white/[0.02] border border-white/5 rounded-[2rem] p-6 shadow-2xl relative overflow-hidden group hover:border-blue-500/20 transition-all">
+                            <div className="lg:col-span-12 flex gap-3 bg-white/[0.03] border border-white/5 rounded-lg p-3 shadow-lg relative overflow-hidden group hover:border-blue-500/20 transition-all">
                                 <div className="absolute inset-0 bg-gradient-to-br from-blue-600/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
                                 
                                 {/* Thumbnail */}
-                                <div className="w-48 h-28 bg-black/40 rounded-2xl flex-shrink-0 overflow-hidden flex items-center justify-center border border-white/5 shadow-inner">
+                                <div className="w-24 h-14 bg-black/40 rounded-md flex-shrink-0 overflow-hidden flex items-center justify-center border border-white/5 shadow-inner">
                                     {media?.thumbnail
                                         ? <img src={media.thumbnail} alt="thumb" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
                                         : isLoading
-                                            ? <Loader2 className="w-8 h-8 text-blue-400/40 animate-spin" />
-                                            : <Film className="w-8 h-8 text-blue-400/20" />}
+                                            ? <Loader2 className="w-6 h-6 text-blue-400/40 animate-spin" />
+                                            : <Film className="w-6 h-6 text-blue-400/20" />}
                                 </div>
 
-                                <div className="flex-1 flex flex-col justify-center gap-2 min-w-0">
+                                <div className="flex-1 flex flex-col justify-center gap-1.5 min-w-0">
                                     {isLoading ? (
                                         <div className="space-y-2">
                                             <div className="h-4 w-3/4 bg-white/5 rounded-lg animate-pulse" />
@@ -229,12 +336,12 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
                                         </div>
                                     ) : (
                                         <>
-                                            <p className="text-white font-black text-lg leading-tight truncate">{media?.title || 'Resolving Media Title...'}</p>
-                                            <div className="flex flex-wrap gap-4 text-xs text-muted-foreground font-bold tracking-tight">
-                                                {media?.uploader && <span className="flex items-center gap-1.5"><Info className="w-3 h-3 text-blue-400" /> {media.uploader}</span>}
-                                                {media?.durationFormatted && <span className="flex items-center gap-1.5"><Clock className="w-3 h-3 text-blue-400" /> {media.durationFormatted}</span>}
-                                                {media?.source && <span className="bg-blue-600/20 text-blue-400 px-2.5 py-1 rounded-lg text-[10px] uppercase font-black tracking-widest">{media.source}</span>}
-                                                {media?.isLive && <span className="bg-red-600/20 text-red-400 px-2.5 py-1 rounded-lg text-[10px] uppercase font-black tracking-widest animate-pulse">● LIVE</span>}
+                                            <p className="text-white font-black text-base leading-tight truncate">{media?.title || 'Resolving Media Title...'}</p>
+                                            <div className="flex flex-wrap gap-3 text-[10px] text-muted-foreground font-bold tracking-tight">
+                                                {media?.uploader && <span className="flex items-center gap-1"><Info className="w-2.5 h-2.5 text-blue-400" /> {media.uploader}</span>}
+                                                {media?.durationFormatted && <span className="flex items-center gap-1"><Clock className="w-2.5 h-2.5 text-blue-400" /> {media.durationFormatted}</span>}
+                                                {media?.source && <span className="bg-blue-600/20 text-blue-400 px-2 py-0.5 rounded text-[8px] uppercase font-black tracking-widest">{media.source}</span>}
+                                                {media?.isLive && <span className="bg-red-600/20 text-red-400 px-2 py-0.5 rounded text-[8px] uppercase font-black tracking-widest animate-pulse">● LIVE</span>}
                                             </div>
                                             {analyzeError && <p className="text-red-400/80 text-[10px] font-bold">⚠ {analyzeError}</p>}
                                         </>
@@ -243,79 +350,79 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
                             </div>
 
                             {/* Source URL with Copy */}
-                            <div className="lg:col-span-12 space-y-3">
-                                <Label className="text-xs text-white/40 uppercase font-black tracking-[0.2em] flex items-center gap-2 ml-1">
+                            <div className="lg:col-span-12 space-y-1.5">
+                                <Label className="text-[9px] text-white/40 uppercase font-black tracking-[0.2em] flex items-center gap-2 ml-1">
                                     Source URL
                                 </Label>
                                 <div 
                                     onClick={copyUrl}
-                                    className="group relative cursor-pointer bg-black/40 border border-white/5 hover:border-blue-500/30 text-xs text-blue-400/80 font-mono p-4 rounded-2xl shadow-inner transition-all flex items-center gap-4 overflow-hidden"
+                                    className="group relative cursor-pointer bg-black/40 border border-white/5 hover:border-blue-500/30 text-[10px] text-blue-400/80 font-mono p-3 rounded-xl shadow-inner transition-all flex items-center gap-3 overflow-hidden"
                                 >
                                     <div className="absolute inset-0 bg-blue-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
-                                    <Link className="w-4 h-4 shrink-0 opacity-50 group-hover:opacity-100 transition-opacity" />
+                                    <Link className="w-3.5 h-3.5 shrink-0 opacity-50 group-hover:opacity-100 transition-opacity" />
                                     <span className="flex-1 truncate leading-relaxed">{url}</span>
-                                    {copied ? <Check className="w-4 h-4 text-green-400 shrink-0" /> : <div className="text-[10px] font-black uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-all">Copy</div>}
+                                    {copied ? <Check className="w-3.5 h-3.5 text-green-400 shrink-0" /> : <div className="text-[9px] font-black uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-all">Copy</div>}
                                 </div>
                             </div>
                         </div>
 
                         {/* Middle Section: Filename + Save Path */}
-                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
                             {/* File Name */}
-                            <div className="space-y-3">
-                                <Label className="text-xs text-white/40 uppercase font-black tracking-[0.2em] flex items-center gap-2 ml-1">
+                            <div className="space-y-1">
+                                <Label className="text-[8px] text-white/30 uppercase font-black tracking-[0.2em] flex items-center gap-2 ml-1">
                                     File Name
                                 </Label>
                                 <Input
                                     ref={fileNameRef}
                                     value={filename}
                                     onChange={(e) => setFilename(e.target.value)}
-                                    className="bg-white/5 border-white/10 h-14 px-6 rounded-2xl text-white font-bold focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500/50 transition-all shadow-inner text-sm"
+                                    className="bg-white/[0.02] border-white/5 h-8 px-3 rounded-md text-white font-medium focus:ring-2 focus:ring-blue-500/10 focus:border-blue-500/30 transition-all shadow-inner text-[11px]"
                                     placeholder="Enter file name..."
                                 />
                             </div>
 
                             {/* Save Path */}
-                            <div className="space-y-3">
-                                <Label className="text-xs text-white/40 uppercase font-black tracking-[0.2em] flex items-center gap-2 ml-1">
+                            <div className="space-y-1">
+                                <Label className="text-[8px] text-white/30 uppercase font-black tracking-[0.2em] flex items-center gap-2 ml-1">
                                     Save Destination
                                 </Label>
-                                <div className="flex gap-3">
+                                <div className="flex gap-2">
                                     <Input
                                         value={savePath}
                                         onChange={(e) => setSavePath(e.target.value)}
-                                        className="bg-white/5 border-white/10 h-14 flex-1 px-6 rounded-2xl text-white text-xs shadow-inner font-mono text-muted-foreground"
+                                        className="bg-white/[0.02] border-white/5 h-8 flex-1 px-3 rounded-md text-white text-[10px] shadow-inner font-mono text-white/50"
                                         readOnly
                                     />
                                     <Button 
                                         onClick={pickFolder}
-                                        className="h-14 w-14 bg-blue-600/10 border border-blue-500/20 hover:bg-blue-600/20 rounded-2xl transition-all flex-shrink-0 group shadow-lg"
+                                        className="h-8 w-8 bg-white/5 border border-white/5 hover:bg-white/10 rounded-md transition-all flex-shrink-0 group"
                                     >
-                                        <FolderOpen className="w-6 h-6 text-blue-400 group-hover:scale-110 transition-transform" />
+                                        <FolderOpen className="w-3.5 h-3.5 text-white/40 group-hover:text-blue-400 transition-colors" />
                                     </Button>
                                 </div>
                             </div>
                         </div>
 
                         {/* Optional Section: Advanced Settings Toggle */}
-                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-end">
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-end">
                              {/* Turbo */}
-                             <div className="flex items-center justify-between bg-white/[0.02] p-5 rounded-[1.5rem] border border-white/5 h-16 group hover:border-yellow-500/20 transition-all">
-                                <div className="flex items-center gap-4">
-                                    <div className={`p-2 rounded-xl transition-all ${isSpeedBoost ? 'bg-yellow-500/20 border border-yellow-500/30' : 'bg-white/5 border border-white/5'}`}>
-                                        <Zap className={`w-4 h-4 ${isSpeedBoost ? 'text-yellow-500 fill-yellow-500/50' : 'text-muted-foreground'}`} />
+                             <div className="flex items-center justify-between bg-white/[0.02] p-2 rounded-lg border border-white/5 h-10 group hover:border-yellow-500/20 transition-all">
+                                <div className="flex items-center gap-2">
+                                    <div className={`p-1 rounded-md transition-all ${isSpeedBoost ? 'bg-yellow-500/20 border border-yellow-500/30' : 'bg-white/5 border border-white/5'}`}>
+                                        <Zap className={`w-3 h-3 ${isSpeedBoost ? 'text-yellow-500 fill-yellow-500/50' : 'text-muted-foreground'}`} />
                                     </div>
                                     <div className="flex flex-col">
-                                        <span className={`text-xs font-black uppercase tracking-widest ${isSpeedBoost ? 'text-white' : 'text-muted-foreground'}`}>Turbo Engine</span>
-                                        <span className="text-[9px] text-muted-foreground font-bold">16 Parallel connections</span>
+                                        <span className={`text-[9px] font-black uppercase tracking-widest ${isSpeedBoost ? 'text-white' : 'text-muted-foreground'}`}>Turbo</span>
+                                        <span className="text-[7px] text-muted-foreground font-bold">16 Parallel</span>
                                     </div>
                                 </div>
-                                <Switch checked={isSpeedBoost} onCheckedChange={setIsSpeedBoost} className="data-[state=checked]:bg-blue-600" />
+                                <Switch checked={isSpeedBoost} onCheckedChange={setIsSpeedBoost} className="data-[state=checked]:bg-blue-600 scale-[0.7]" />
                             </div>
 
                             {/* Schedule */}
-                            <div className="space-y-3">
-                                <Label className="text-xs text-white/40 uppercase font-black tracking-[0.2em] flex items-center gap-2 ml-1">
+                            <div className="space-y-1">
+                                <Label className="text-[8px] text-white/40 uppercase font-black tracking-[0.2em] flex items-center gap-2 ml-1">
                                     Schedule Start
                                 </Label>
                                 <div className="relative">
@@ -323,7 +430,7 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
                                         type="datetime-local"
                                         value={scheduledAt}
                                         onChange={(e) => setScheduledAt(e.target.value)}
-                                        className="bg-white/5 border-white/10 h-14 px-6 rounded-2xl text-white font-mono text-xs focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500/50 transition-all [color-scheme:dark]"
+                                        className="bg-white/5 border-white/10 h-8 px-3 rounded-md text-white font-mono text-[10px] focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500/50 transition-all [color-scheme:dark]"
                                     />
                                 </div>
                             </div>
@@ -331,24 +438,24 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
 
                         {/* Quality Selection: Modernized */}
                         {!media?.isPlaylist && (media?.source === 'ytdl' || media?.source === 'hls' || media?.source === 'dash' || media?.isYouTube) && (
-                            <div className="space-y-6 pt-4 border-t border-white/5">
-                                <div className="flex items-center justify-between mb-2">
-                                    <Label className="text-xs text-white/40 uppercase font-black tracking-[0.2em] ml-1">Format & Quality</Label>
-                                    <div className="flex bg-black/40 rounded-xl border border-white/5 p-1">
+                            <div className="space-y-3 pt-3 border-t border-white/5">
+                                <div className="flex items-center justify-between mb-0.5">
+                                    <Label className="text-[8px] text-white/40 uppercase font-black tracking-[0.2em] ml-1">Format & Quality</Label>
+                                    <div className="flex bg-black/40 rounded-md border border-white/5 p-0.5">
                                         <button 
                                             onClick={() => { setIsAudioOnly(false); setSelectedQualityId(''); }}
-                                            className={`px-4 py-1.5 rounded-lg text-[10px] font-black transition-all ${!isAudioOnly ? 'bg-blue-600 text-white shadow-lg' : 'text-muted-foreground hover:text-white'}`}
+                                            className={`px-2 py-0.5 rounded text-[8px] font-black transition-all ${!isAudioOnly ? 'bg-blue-600 text-white shadow-md' : 'text-muted-foreground hover:text-white'}`}
                                         >VIDEO</button>
                                         <button 
                                             onClick={() => { setIsAudioOnly(true); setSelectedQualityId(''); }}
-                                            className={`px-4 py-1.5 rounded-lg text-[10px] font-black transition-all ${isAudioOnly ? 'bg-purple-600 text-white shadow-lg' : 'text-muted-foreground hover:text-white'}`}
+                                            className={`px-2 py-0.5 rounded text-[8px] font-black transition-all ${isAudioOnly ? 'bg-purple-600 text-white shadow-md' : 'text-muted-foreground hover:text-white'}`}
                                         >AUDIO</button>
                                     </div>
                                 </div>
 
-                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                                     {isLoading ? (
-                                        [1, 2, 4, 5].map(i => <div key={i} className="h-20 bg-white/5 rounded-3xl animate-pulse" />)
+                                        [1, 2, 4, 5].map(i => <div key={i} className="h-14 bg-white/5 rounded-xl animate-pulse" />)
                                     ) : displayOptions.length > 0 ? (
                                         displayOptions.map((q, i) => {
                                             const qId = q.formatId || q.quality || String(i);
@@ -357,43 +464,43 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
                                                 <button
                                                     key={qId}
                                                     onClick={() => setSelectedQualityId(qId)}
-                                                    className={`group relative flex items-center justify-between p-5 rounded-[1.5rem] border transition-all ${isSelected
-                                                        ? isAudioOnly ? 'bg-purple-600/10 border-purple-500/40 text-white ring-2 ring-purple-500/10' : 'bg-blue-600/10 border-blue-500/40 text-white ring-2 ring-blue-500/10'
+                                                    className={`group relative flex items-center justify-between p-2 rounded-lg border transition-all ${isSelected
+                                                        ? isAudioOnly ? 'bg-purple-600/10 border-purple-500/40 text-white' : 'bg-blue-600/10 border-blue-500/40 text-white'
                                                         : 'bg-black/10 border-white/5 text-muted-foreground hover:border-white/10 hover:bg-white/[0.02]'
                                                         }`}
                                                 >
-                                                    <div className="flex items-center gap-4">
-                                                        <div className={`w-8 h-8 rounded-xl border-2 flex items-center justify-center transition-all ${isSelected
-                                                            ? isAudioOnly ? 'bg-purple-500 border-purple-400 rotate-0 scale-110' : 'bg-blue-500 border-blue-400 rotate-0 scale-110'
-                                                            : 'border-white/10 rotate-12 group-hover:rotate-0'
+                                                    <div className="flex items-center gap-2">
+                                                        <div className={`w-6 h-6 rounded border flex items-center justify-center transition-all ${isSelected
+                                                            ? isAudioOnly ? 'bg-purple-500 border-purple-400 scale-105' : 'bg-blue-500 border-blue-400 scale-105'
+                                                            : 'border-white/10 group-hover:rotate-0'
                                                             }`}>
-                                                                {isSelected ? <Check className="w-4 h-4 text-white" /> : (isAudioOnly ? <Music className="w-4 h-4" /> : <Film className="w-4 h-4" />)}
+                                                                {isSelected ? <Check className="w-3 h-3 text-white" /> : (isAudioOnly ? <Music className="w-3 h-3" /> : <Film className="w-3 h-3" />)}
                                                         </div>
                                                         <div className="text-left">
-                                                            <span className="font-black text-sm block leading-none mb-1">{q.label || q.quality}</span>
-                                                            <div className="flex items-center gap-2 opacity-60">
-                                                                {q.ext && <span className="text-[9px] uppercase font-black">{q.ext}</span>}
-                                                                <span className="text-[9px] uppercase">•</span>
-                                                                <span className="text-[9px] font-black">{q.filesize ? formatFileSize(q.filesize) : 'Unknown Size'}</span>
+                                                            <span className="font-black text-[10px] block leading-none mb-0.5">{q.label || q.quality}</span>
+                                                            <div className="flex items-center gap-1 opacity-60">
+                                                                {q.ext && <span className="text-[7px] uppercase font-black">{q.ext}</span>}
+                                                                <span className="text-[7px] uppercase">•</span>
+                                                                <span className="text-[7px] font-black">{q.filesize ? formatFileSize(q.filesize) : 'Size N/A'}</span>
                                                             </div>
                                                         </div>
                                                     </div>
                                                     {q.height && (
-                                                        <span className={`px-2.5 py-1 rounded-lg font-black text-[10px] uppercase shadow-lg ${
+                                                        <span className={`px-1.5 py-0.5 rounded font-black text-[7px] uppercase shadow-md ${
                                                             q.height >= 2160 ? 'bg-yellow-500 text-black' :
                                                             q.height >= 1080 ? 'bg-blue-600 text-white' :
                                                             'bg-white/10 text-white'
                                                         }`}>
-                                                            {q.height >= 2160 ? '4K UHD' : q.height >= 1080 ? 'Full HD' : q.height >= 720 ? 'HD' : q.height + 'P'}
+                                                            {q.height >= 2160 ? '4K' : q.height >= 1080 ? 'FHD' : q.height >= 720 ? 'HD' : q.height + 'P'}
                                                         </span>
                                                     )}
                                                 </button>
                                             );
                                         })
                                     ) : (
-                                        <div className="col-span-full h-32 flex flex-col items-center justify-center rounded-3xl bg-black/20 border border-dashed border-white/10 gap-3 text-muted-foreground">
-                                            <Radio className="w-6 h-6 opacity-20" />
-                                            <p className="text-xs font-bold uppercase tracking-widest">{analyzeError ? 'Standard Stream' : 'Analyzing format options...'}</p>
+                                        <div className="col-span-full h-20 flex flex-col items-center justify-center rounded-xl bg-black/20 border border-dashed border-white/10 gap-2 text-muted-foreground">
+                                            <Radio className="w-5 h-5 opacity-20" />
+                                            <p className="text-[10px] font-bold uppercase tracking-widest">{analyzeError ? 'Standard Stream' : 'Analyzing format options...'}</p>
                                         </div>
                                     )}
                                 </div>
@@ -417,21 +524,21 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
                 </div>
 
                 {/* ── Action Footer ─────────────────────────────────────────────────── */}
-                <div className="p-8 bg-[#0f172a] border-t border-white/5 flex gap-6 shrink-0 shadow-[0_-10px_30px_rgba(0,0,0,0.5)]">
+                <div className="p-4 bg-[#0f172a] border-t border-white/5 flex gap-3 shrink-0 shadow-[0_-10px_30px_rgba(0,0,0,0.5)]">
                     <Button
-                        className="flex-[2] bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-500 hover:to-blue-600 text-white font-black h-16 rounded-2xl gap-3 shadow-[0_10px_30px_rgba(37,99,235,0.4)] transition-all active:scale-[0.98] text-base group"
+                        className="flex-[2] bg-blue-600 hover:bg-blue-500 text-white font-bold h-9 rounded-lg gap-2 shadow-lg transition-all active:scale-[0.98] text-[11px] group"
                         onClick={() => handleConfirm('now')}
                         disabled={isLoading}
                     >
-                        {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : <Zap className="w-6 h-6 fill-white/20 group-hover:scale-110 transition-transform" />}
-                        {media?.isPlaylist ? `DOWNLOAD ENTIRE PLAYLIST (${media.playlistCount})` : 'DOWNLOAD NOW'}
+                        {isLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5 fill-white/10 group-hover:scale-110 transition-transform" />}
+                        {media?.isPlaylist ? `PROCESS PLAYLIST (${media.playlistCount})` : 'DOWNLOAD NOW'}
                     </Button>
                     <Button
                         variant="secondary"
-                        className="flex-1 bg-white/[0.03] hover:bg-white/[0.08] text-white font-black h-16 rounded-2xl gap-3 px-8 border border-white/10 transition-all active:scale-[0.98] text-sm group"
+                        className="flex-1 bg-white/[0.03] hover:bg-white/[0.06] text-white/60 hover:text-white font-bold h-9 rounded-lg gap-2 px-4 border border-white/5 transition-all active:scale-[0.98] text-[10px] group"
                         onClick={() => handleConfirm('later')}
                     >
-                        <Clock className="w-5 h-5 opacity-40 group-hover:opacity-100 group-hover:scale-110 transition-all" />
+                        <Clock className="w-3 h-3 opacity-40 group-hover:opacity-100 transition-all" />
                         LATER
                     </Button>
                 </div>

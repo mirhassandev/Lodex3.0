@@ -19,6 +19,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openFolder: (path) => ipcRenderer.invoke('open/folder', path),
   selectFolder: () => ipcRenderer.invoke('dialog/select-folder'),
   closeDialog: () => ipcRenderer.send('dialog/close'),
+  minimize: () => ipcRenderer.send('window/minimize'),
+  close: () => ipcRenderer.send('window/close'),
+  refreshSettings: () => ipcRenderer.invoke('settings/refresh'),
   onDownloadDetected: (cb) => {
     ipcRenderer.on('download-detected', (_e, source, url, headers, meta) => cb(source, url, headers, meta));
     return () => ipcRenderer.removeAllListeners('download-detected');

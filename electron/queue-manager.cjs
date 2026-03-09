@@ -42,6 +42,13 @@ class QueueManager extends EventEmitter {
             }
         }
 
+        // Strict limit enforcement: if we now have MORE active than allowed, pause the extras
+        if (this.active.size > this.maxConcurrent) {
+            const toPause = Array.from(this.active.keys()).slice(this.maxConcurrent);
+            console.log(`[QueueManager] Concurrency limit reduced. Pausing ${toPause.length} items.`);
+            toPause.forEach(id => this.pause(id));
+        }
+
         this.processQueue();
     }
 
@@ -65,15 +72,19 @@ class QueueManager extends EventEmitter {
             retryCount: metadata.retryCount || 0
         };
 
+        const task = this.dm.tasks.get(id);
         if (status === 'scheduled' && entry.scheduledAt > Date.now()) {
             this.scheduled.push(entry);
+            if (task) task.status = 'scheduled';
             console.log(`[Queue] Item ${id} scheduled for ${new Date(entry.scheduledAt).toISOString()}`);
         } else {
             this.waiting.push(entry);
+            if (task) task.status = 'queued';
             this._sortWaiting();
             console.log(`[Queue] Item ${id} added to waiting list (Priority: ${priority})`);
         }
 
+        // Immediately try to process in case slots are free or schedule is now
         this.processQueue();
     }
 
@@ -81,38 +92,32 @@ class QueueManager extends EventEmitter {
      * Main loop to move "waiting" -> "active"
      */
     processQueue() {
+        // If we have available slots, start the next normal tasks
         while (this.active.size < this.maxConcurrent && this.waiting.length > 0) {
             const next = this.waiting.shift();
             const task = this.dm.tasks.get(next.id);
 
-            if (!task) continue;
-
-            this.active.set(next.id, task);
-
-            // Apply current speed limit sharing
-            if (task.throttle) {
-                task.throttle(this.getLimitPerTask());
+            if (!task) {
+                console.warn(`[QueueManager] Task ${next.id} not found in DownloadManager, skipping.`);
+                continue;
             }
+
+            // Update status to 'downloading' and notify
+            task.status = 'downloading';
+            this.active.set(next.id, task);
+            this.dm.emit('download', { id: next.id, event: 'started', payload: { size: task.size } });
 
             console.log(`[Queue] Starting download: ${next.id} (${this.active.size}/${this.maxConcurrent})`);
 
             // Wire up completion/error handlers
             this._attachTaskHandlers(task);
 
-            try {
-                task.start().catch(err => {
-                    console.error(`[Queue] Async start error for ${next.id}:`, err.message);
-                    // The error event should handle cleanup, but as a safety:
-                    if (this.active.has(next.id)) {
-                        this.active.delete(next.id);
-                        this.processQueue();
-                    }
-                });
-            } catch (err) {
-                console.error(`[Queue] Sync start error for ${next.id}:`, err.message);
+            // Start the task
+            task.start().catch(err => {
+                console.error(`[Queue] Start error for ${next.id}:`, err);
                 this.active.delete(next.id);
                 this.processQueue();
-            }
+            });
         }
     }
 
@@ -152,6 +157,8 @@ class QueueManager extends EventEmitter {
             task.removeListener('error', onError);
         };
 
+        task.removeAllListeners('finished');
+        task.removeAllListeners('error');
         task.once('finished', onFinished);
         task.once('error', onError);
     }
@@ -197,11 +204,13 @@ class QueueManager extends EventEmitter {
                 ready.forEach(item => {
                     this.scheduled = this.scheduled.filter(s => s.id !== item.id);
                     this.waiting.push({ ...item, scheduledAt: null });
+                    const task = this.dm.tasks.get(item.id);
+                    if (task) task.status = 'queued';
                 });
                 this._sortWaiting();
                 this.processQueue();
             }
-        }, 60000); // 1 minute ticker
+        }, 10000); // Check every 10 seconds for responsive scheduling
     }
 
     // Manual Reordering

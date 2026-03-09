@@ -34,6 +34,16 @@ const { URL } = require('url');
 const WebSocket = require('ws');
 const { exec } = require('child_process');
 
+// ── Silence noisy Chromium SSL / network logs ─────────────────────────────
+// These logs (ssl_client_socket_impl, net_error -101, etc.) are harmless
+// internal Chromium messages that flood the console. Suppress them here.
+if (app && app.commandLine) {
+  app.commandLine.appendSwitch('log-level', '3');        // Only FATAL logs
+  app.commandLine.appendSwitch('disable-logging');
+  app.commandLine.appendSwitch('silent-launch');
+  app.commandLine.appendSwitch('disable-features', 'NetworkService,NetworkServiceInProcess');
+}
+
 console.log('[Electron] Starting app...');
 
 let serverProcess = null;
@@ -170,8 +180,8 @@ function showNewDownloadDialog(source, url, meta = {}) {
   console.log(`[Bridge] Opening Dialog for ${source}:`, url);
 
   const dialogWindow = new BrowserWindow({
-    width: 1000,
-    height: 750,
+    width: 850,
+    height: 600,
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
@@ -201,17 +211,31 @@ function showNewDownloadDialog(source, url, meta = {}) {
     dialogWindow.webContents.send('download-detected', source, url, headers, meta);
   });
 
-  // Self-closing on IPC
-  ipcMain.once('dialog/close', () => {
-    if (!dialogWindow.isDestroyed()) dialogWindow.close();
+  dialogWindow.on('blur', () => {
+    if (!dialogWindow.isDestroyed()) {
+      dialogWindow.minimize();
+    }
   });
+
+  // Self-closing on IPC (target specific window)
+  const closeListener = (event) => {
+    if (BrowserWindow.fromWebContents(event.sender) === dialogWindow) {
+      if (!dialogWindow.isDestroyed()) {
+        dialogWindow.close();
+        ipcMain.removeListener('dialog/close', closeListener);
+      }
+    }
+  };
+  ipcMain.on('dialog/close', closeListener);
 }
 
 // Forward download events to renderer and sync DB
 dm.on('download', ({ id, event, payload }) => {
-  if (mainWindow && mainWindow.webContents) {
-    mainWindow.webContents.send(`download/${event}`, { id, ...payload });
-  }
+  BrowserWindow.getAllWindows().forEach(win => {
+    if (!win.isDestroyed() && win.webContents) {
+      win.webContents.send(`download/${event}`, { id, ...payload });
+    }
+  });
 
   let updateData = {};
   if (event === 'started') {
@@ -223,7 +247,14 @@ dm.on('download', ({ id, event, payload }) => {
       size: payload.total || 0,
     };
   } else if (event === 'finished') {
-    updateData = { status: 'completed', progress: 100, speed: 0 };
+    // Ensure final size is saved if it was missed during progress
+    const task = dm.tasks.get(id);
+    updateData = { 
+      status: 'completed', 
+      progress: 100, 
+      speed: 0,
+      size: payload.size || (task ? task.size : 0)
+    };
   } else if (event === 'error') {
     updateData = { status: 'failed', speed: 0 };
   } else if (event === 'paused') {
@@ -393,28 +424,22 @@ app.on('before-quit', () => {
   }
 });
 
-// Clipboard Monitor
-const { clipboard } = require('electron');
-let lastClipboardText = '';
-setInterval(() => {
-  const text = clipboard.readText();
-  if (text && text !== lastClipboardText) {
-    lastClipboardText = text;
-    // Simple URL validation
-    if (text.startsWith('http://') || text.startsWith('https://')) {
-      // Validate URL object
-      try {
-        new URL(text);
-        console.log('[Clipboard] URL detected:', text);
-        showNewDownloadDialog('clipboard', text);
-      } catch (e) { }
-    }
-  }
-}, 1000);
+// Clipboard Monitor removed as per user request
+
 
 // Initialization of persistence is now handled by API load.
 
-// IPC Handlers - Real download integration
+// IPC Handlers - Window Controls
+ipcMain.on('window/minimize', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) win.minimize();
+});
+
+ipcMain.on('window/close', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) win.close();
+});
+
 ipcMain.on('dialog/close', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win) win.close();
@@ -483,6 +508,12 @@ ipcMain.handle('download/update-priority', async (_event, id, priority) => {
     return { ok: true };
   }
   return { ok: false };
+});
+
+ipcMain.handle('settings/refresh', async () => {
+  console.log('[Electron] Refreshing settings from API...');
+  await dm._fetchSettings();
+  return { ok: true };
 });
 
 ipcMain.handle('dialog/select-folder', async () => {
@@ -556,7 +587,9 @@ ipcMain.handle('youtube/get-info', async (_event, url) => {
         '--no-warnings',
         '--flat-playlist',
         '--no-check-certificate',
-        '--no-call-home',
+        '--quiet',
+        '--no-video-multistreams', // Faster for simple metadata
+        '--no-playlist', // Force no playlist expansion unless explicitly needed
         '--socket-timeout', '10',
         '--add-header', 'referer:youtube.com',
         '--add-header', 'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
@@ -640,6 +673,8 @@ ipcMain.handle('download/start', async (_event, url, options = {}) => {
     let dbId;
     try {
       const { randomUUID } = require('crypto');
+      const scheduledAtValue = options.scheduledAt ? new Date(options.scheduledAt) : null;
+      const statusValue = options.status || 'queued';
       const res = await fetch('http://127.0.0.1:5000/api/downloads', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -648,9 +683,11 @@ ipcMain.handle('download/start', async (_event, url, options = {}) => {
           url,
           filename,
           filePath: outPath,
-          status: 'queued',
+          status: statusValue,
           progress: 0,
-          size: 0
+          size: 0,
+          scheduledAt: scheduledAtValue,
+          priority: options.priority || 'normal'
         })
       });
       if (!res.ok) throw new Error('API Response not ok');
@@ -661,7 +698,7 @@ ipcMain.handle('download/start', async (_event, url, options = {}) => {
       dbId = undefined; // Will fallback to local ID generated in downloader
     }
 
-    // Create and start download task with quality options
+    // Create download task — passes scheduledAt & status so the queue manager can hold it
     const task = await dm.create(url, outPath, {
       connections: options.connections || 8,
       resolution: options.quality,
@@ -669,22 +706,28 @@ ipcMain.handle('download/start', async (_event, url, options = {}) => {
       type: options.type,
       protocol: options.protocol,
       isAudioOnly: options.isAudioOnly || options.quality === 'audio',
-      headers: options.headers || {}
+      headers: options.headers || {},
+      scheduledAt: options.scheduledAt || null,
+      status: options.status || 'queued',
+      priority: options.priority || 'normal'
     }, dbId);
 
-    // Notify main window immediately so it shows up in the list
-    if (mainWindow && mainWindow.webContents) {
-      mainWindow.webContents.send('download/created', {
-        id: task.id,
-        name: filename,
-        url: url,
-        status: task.status,
-        progress: 0,
-        size: task.size,
-        outPath: outPath,
-        dateAdded: new Date().toISOString().split('T')[0]
-      });
-    }
+    // Notify ALL windows so both main and dialog windows get the new entry
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed() && win.webContents) {
+        win.webContents.send('download/created', {
+          id: task.id,
+          name: filename,
+          url: url,
+          status: task.status || options.status || 'queued',
+          progress: 0,
+          size: task.size,
+          outPath: outPath,
+          scheduledAt: options.scheduledAt || null,
+          dateAdded: new Date().toISOString().split('T')[0]
+        });
+      }
+    });
 
     try {
       console.log('[IPC] Download queued with ID:', task.id);

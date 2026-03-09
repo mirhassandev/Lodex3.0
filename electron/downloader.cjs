@@ -226,6 +226,9 @@ class DownloadTask extends EventEmitter {
         '--force-overwrites',
         '--no-playlist',
         '--newline',
+        '--continue', // Add --continue for resuming
+        '--progress', // Enable progress output
+        '--progress-template', 'download:[%(progress.downloaded_bytes)s/%(progress.total_bytes)s] speed:[%(progress.speed)s] eta:[%(progress.eta)s]', // Custom progress template
         ...headerArgs
       ];
 
@@ -263,7 +266,38 @@ class DownloadTask extends EventEmitter {
 
             if (this.size) {
               this.downloaded = Math.floor((percent / 100) * this.size);
-              this.emit('progress', { id: this.id, downloaded: this.downloaded, total: this.size });
+              this.emit('progress', { id: this.id, downloaded: this.downloaded, total: this.size, outPath: this.outPath });
+            }
+          } else if (line.startsWith('download:')) { // Parse custom progress template
+            const downloadedMatch = line.match(/download:\[(\d+(\.\d+)?)([KMG]i?B)\/(\d+(\.\d+)?)([KMG]i?B)\]/);
+            const speedMatch = line.match(/speed:\[(\d+(\.\d+)?)([KMG]i?B\/s)\]/);
+            const etaMatch = line.match(/eta:\[(\d+:\d+:\d+)\]/);
+
+            if (downloadedMatch) {
+              const parseBytes = (val, unit) => {
+                let bytes = parseFloat(val);
+                if (unit.includes('K')) bytes *= 1024;
+                if (unit.includes('M')) bytes *= 1024 * 1024;
+                if (unit.includes('G')) bytes *= 1024 * 1024 * 1024;
+                return Math.floor(bytes);
+              };
+
+              const downloadedBytes = parseBytes(downloadedMatch[1], downloadedMatch[3]);
+              const totalBytes = parseBytes(downloadedMatch[4], downloadedMatch[6]);
+              const speedStr = speedMatch ? speedMatch[1] + speedMatch[3] : '0B/s';
+              const etaStr = etaMatch ? etaMatch[1] : '00:00:00';
+
+              this.downloaded = downloadedBytes;
+              this.size = totalBytes;
+
+              this.emit('progress', {
+                id: this.id,
+                downloaded: downloadedBytes,
+                total: totalBytes,
+                speed: speedStr,
+                eta: etaStr,
+                outPath: this.outPath
+              });
             }
           }
         }
@@ -298,21 +332,62 @@ class DownloadTask extends EventEmitter {
   async _streamDownload() {
     try {
       const res = await requestWithRedirect(this.url, {
-         method: 'GET',
-         headers: {
-           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-           ...this.customHeaders
-         },
-         timeout: this.timeout
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/octet-stream, */*',
+          ...this.customHeaders
+        },
+        timeout: this.timeout
       });
 
       if (res.statusCode >= 400) {
+        res.resume();
         throw new Error(`HTTP ${res.statusCode}`);
       }
 
       // Update URL to final direct target if it redirected
       if (res.finalUrl && res.finalUrl !== this.url) {
         this.url = res.finalUrl;
+      }
+
+      const contentType = (res.headers['content-type'] || '').toLowerCase();
+      const urlPath = new URL(this.url).pathname.toLowerCase();
+      const isLikelyBinary = /\.(exe|dmg|iso|zip|tar|gz|msi|apk|pkg|deb|rpm|7z|rar|bin|img)/.test(urlPath);
+
+      // Detect mirror-selector pages (like get.videolan.org) that return HTML instead of the file
+      if (contentType.includes('text/html') && isLikelyBinary) {
+        // Buffer up to 8KB to look for meta-refresh or direct download link
+        console.log(`[DownloadTask] HTML detected for binary URL on ${this.id}. Scanning for redirect...`);
+        const chunks = [];
+        let totalRead = 0;
+        await new Promise((resolve) => {
+          res.on('data', (chunk) => {
+            if (totalRead < 8192) {
+              chunks.push(chunk);
+              totalRead += chunk.length;
+            } else {
+              res.destroy();
+              resolve();
+            }
+          });
+          res.on('end', resolve);
+          res.on('error', resolve);
+        });
+        const html = Buffer.concat(chunks).toString('utf8');
+        // Look for meta-refresh redirect: <meta http-equiv="refresh" content="0; url=...">
+        const metaMatch = html.match(/content=["'][\d.]+;\s*url=([^"']+)["']/i);
+        if (metaMatch) {
+          let redirectUrl = metaMatch[1].trim();
+          if (!redirectUrl.startsWith('http')) {
+            redirectUrl = new URL(redirectUrl, this.url).href;
+          }
+          console.log(`[DownloadTask] Meta-refresh redirect found: ${redirectUrl}`);
+          this.url = redirectUrl;
+          return this._streamDownload(); // retry with new URL
+        }
+        // No redirect found — surface error to user
+        throw new Error('URL leads to a web page, not a direct download. Please copy the direct download link.');
       }
 
       const contentLength = parseInt(res.headers['content-length'] || '0', 10);
@@ -325,30 +400,28 @@ class DownloadTask extends EventEmitter {
 
       const writeStream = fs.createWriteStream(this.outPath);
 
-      res.on('data', async (chunk) => {
+      res.on('data', (chunk) => {
         if (this.aborted || this.completed) {
           res.destroy();
           writeStream.destroy();
           return;
         }
         this.downloaded += chunk.length;
-        this.emit('progress', { id: this.id, downloaded: this.downloaded, total: this.size });
-
-        if (this.speedLimit > 0) {
-          const delay = (chunk.length / this.speedLimit) * 1000;
-          if (delay > 2) {
-            res.pause();
-            await new Promise(r => setTimeout(r, Math.min(delay, 2000)));
-            res.resume();
-          }
+        // Speed and progress is reported by _startSpeedTicker every 1s
+        if (!this.size && contentLength === 0) {
+          // Unknow size: update best-effort from running bytes
+          this.size = this.downloaded; // will be corrected on next tick
         }
       });
 
       res.pipe(writeStream);
 
       writeStream.on('finish', () => {
-        this.completed = true;
-        this.emit('finished', { id: this.id, path: this.outPath });
+        if (!this.aborted) {
+          this.completed = true;
+          if (this.speedInterval) clearInterval(this.speedInterval);
+          this.emit('finished', { id: this.id, path: this.outPath, size: this.downloaded });
+        }
       });
 
       writeStream.on('error', (err) => {
@@ -356,7 +429,7 @@ class DownloadTask extends EventEmitter {
       });
 
       res.on('error', (err) => {
-        this.emit('error', err);
+        if (!this.aborted) this.emit('error', err);
       });
     } catch (err) {
       this.emit('error', err);
@@ -404,7 +477,7 @@ class DownloadTask extends EventEmitter {
             
             range.downloaded += chunk.length;
             this.downloaded += chunk.length;
-            this.emit('progress', { id: this.id, downloaded: this.downloaded, total: this.size });
+            // Don't emit per-chunk progress — _startSpeedTicker handles this every 1s with speed included
 
             // Throttling Logic for segmented ranges
             if (this.speedLimit > 0) {
@@ -444,11 +517,10 @@ class DownloadTask extends EventEmitter {
 
   _checkComplete() {
     if (this.ranges.every(r => r.done)) {
-      this.completed = true; // Mark completed
+      this.completed = true;
       if (this.speedInterval) clearInterval(this.speedInterval);
-      this.emit('finished', { id: this.id, path: this.outPath });
+      this.emit('finished', { id: this.id, path: this.outPath, size: this.size });
       if (this.fileHandle) this.fileHandle.close().catch(() => { });
-      // cleanup manifest if exists
       fs.unlink(this.manifestPath, () => { });
     }
   }

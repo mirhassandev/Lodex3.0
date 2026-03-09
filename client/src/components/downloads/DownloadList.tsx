@@ -142,7 +142,9 @@ export function DownloadList({ downloads, filter, setDownloads, selectedIds, onT
                 </div>
               </div>
 
-              <div className="text-sm font-mono text-muted-foreground">{item.size}</div>
+              <div className="text-sm font-mono text-muted-foreground">
+                {item.totalBytes ? formatBytes(item.totalBytes) : item.size || "Unknown"}
+              </div>
 
               <div>
                 <span className={cn(
@@ -155,7 +157,7 @@ export function DownloadList({ downloads, filter, setDownloads, selectedIds, onT
                             item.status === "retrying" ? "bg-orange-500/20 text-orange-400 border border-orange-500/20 animate-pulse" :
                               "bg-destructive/20 text-destructive border border-destructive/20"
                 )}>
-                  {item.status === 'downloading' && item.progress >= 100 ? 'Finalizing' : item.status}
+                  {item.status === 'downloading' && item.progress >= 100 ? 'Finalizing' : (item.status === 'queued' ? 'In Queue' : item.status)}
                   {item.status === 'scheduled' && item.scheduledAt && (
                     <span className="ml-1 opacity-60 normal-case font-mono">
                       @ {new Date(item.scheduledAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}

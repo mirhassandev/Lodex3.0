@@ -7,7 +7,7 @@
   "scripts": {
     "dev:client": "vite dev --port 5000",
     "dev": "tsx server/index.ts",
-    "dev:desktop": "set ELECTRON_RUN_AS_NODE= && electron .",
+    "dev:desktop": "node launcher.cjs",
     "build": "tsx script/build.ts",
     "start": "node dist/index.cjs",
     "check": "tsc",

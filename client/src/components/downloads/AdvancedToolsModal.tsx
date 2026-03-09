@@ -289,6 +289,31 @@ export function AdvancedToolsModal({ open, onOpenChange, initialTab = "scheduler
 
               <TabsContent value="queues" className="mt-0 space-y-6">
                 <div className="space-y-4">
+                  <div className="flex justify-between items-center bg-secondary/10 p-4 rounded-xl border border-border/50">
+                    <div className="space-y-1">
+                      <h4 className="font-semibold flex items-center gap-2">
+                        <ArrowDownToLine className="w-4 h-4 text-primary" />
+                        Simultaneous Downloads
+                      </h4>
+                      <p className="text-xs text-muted-foreground">How many files should download at the same time?</p>
+                    </div>
+                    <Select 
+                      value={String(settings?.concurrentDownloads || 3)} 
+                      onValueChange={(val) => onSettingsChange && onSettingsChange({ concurrentDownloads: parseInt(val, 10) })}
+                    >
+                      <SelectTrigger className="w-32 bg-background">
+                        <SelectValue placeholder="Select" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="1">1 at a time</SelectItem>
+                        <SelectItem value="2">2 downloads</SelectItem>
+                        <SelectItem value="3">3 downloads</SelectItem>
+                        <SelectItem value="5">5 downloads</SelectItem>
+                        <SelectItem value="10">10 downloads</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
                   <div className="flex justify-between items-center">
                     <h4 className="font-semibold">Active Queues</h4>
                     <Button size="sm" variant="ghost" className="text-primary">+ New Queue</Button>

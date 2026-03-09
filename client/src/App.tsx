@@ -8,7 +8,9 @@ import { Toaster } from "@/components/ui/toaster";
 import { useToast } from "@/hooks/use-toast";
 import { AdvancedToolsModal } from "@/components/downloads/AdvancedToolsModal";
 import { NewDownloadDialog } from "@/components/downloads/NewDownloadDialog";
-import { formatSpeed, formatEta } from "@/lib/formatters";
+import { DialogProgressView } from "@/components/downloads/DialogProgressView";
+import { formatSpeed, formatEta, formatBytes } from "@/lib/formatters";
+const electronAPI = (window as any).electronAPI;
 
 function App() {
   const [activeFilter, setActiveFilter] = useState<FileType | "all">("all");
@@ -21,6 +23,7 @@ function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const speedTrackingRef = useRef<Record<string, { downloaded: number; timestamp: number }>>({});
   const [pendingDownload, setPendingDownload] = useState<{ url: string, headers?: any, meta?: any } | null>(null);
+  const [activeDialogDownloadId, setActiveDialogDownloadId] = useState<string | null>(null);
 
   useEffect(() => {
     // Initial fetch from API
@@ -87,7 +90,6 @@ function App() {
       return;
     }
 
-    const electronAPI = (window as any).electronAPI;
 
     // Smart classification — pre-resolve filename, type, and size
     let classifiedMeta: any = null;
@@ -118,6 +120,7 @@ function App() {
           type: classifiedMeta?.type,
           priority: youtubeOptions?.priority,
           scheduledAt: youtubeOptions?.scheduledAt,
+          status: youtubeOptions?.status || 'queued',
         };
         const res = await electronAPI.startDownload(url, startOptions);
         if (res && res.ok) {
@@ -140,13 +143,17 @@ function App() {
             retryCount: 0
           };
           setDownloads(prev => [itemWithId, ...prev]);
-          toast({ title: "Download Started", description: `Started downloading ${itemWithId.name}` });
+          const isScheduled = youtubeOptions?.status === 'scheduled';
+          toast({ 
+            title: isScheduled ? "Download Scheduled" : "Download Started", 
+            description: isScheduled 
+              ? `Scheduled: ${itemWithId.name}` 
+              : `Started downloading ${itemWithId.name}` 
+          });
 
-          // Phase 8: If in dialog mode, close the window after a short delay
-          if (window.location.search.includes("dialog=true")) {
-            setTimeout(() => {
-              if (electronAPI.closeDialog) electronAPI.closeDialog();
-            }, 800);
+          // Only switch to progress view for immediate (non-scheduled) downloads
+          if (window.location.search.includes("dialog=true") && !isScheduled) {
+            setActiveDialogDownloadId(res.id);
           }
           return;
         } else {
@@ -185,7 +192,6 @@ function App() {
 
   // Wire electron download events (progress/finished/error/clipboard)
   useEffect(() => {
-    const electronAPI = (window as any).electronAPI;
     if (!electronAPI) return;
 
     // Initial load now relies on Express API, no longer IPC listDownloads.
@@ -214,6 +220,7 @@ function App() {
         // Prevent duplicates if handleAddDownload already added it
         if (prev.find(d => d.id === data.id)) return prev;
         
+        const isScheduled = data.status === 'scheduled';
         const newItem: DownloadItem = {
           id: data.id,
           name: data.name,
@@ -222,13 +229,14 @@ function App() {
           progress: 0,
           downloadedBytes: 0,
           totalBytes: data.size || 0,
-          speed: '0 KB/s',
-          eta: 'Starting...',
+          speed: isScheduled ? 'Scheduled' : '0 KB/s',
+          eta: isScheduled && data.scheduledAt ? `Starts ${new Date(data.scheduledAt).toLocaleString()}` : 'Starting...',
           type: getFileType(data.name),
           dateAdded: data.dateAdded || new Date().toISOString().split('T')[0],
           outPath: data.outPath,
           size: data.size ? `${(data.size / (1024 * 1024)).toFixed(2)} MB` : "Calculating...",
           priority: 'normal',
+          scheduledAt: data.scheduledAt ? new Date(data.scheduledAt).getTime() : undefined,
           retryCount: 0
         };
         return [newItem, ...prev];
@@ -241,20 +249,29 @@ function App() {
 
       setDownloads(prev => prev.map(d => d.id === data.id ? {
         ...d,
-        downloadedBytes: data.downloaded,
-        totalBytes: data.total,
+        downloadedBytes: data.downloaded ?? d.downloadedBytes,
+        totalBytes: data.total || d.totalBytes,
+        size: (data.total || d.totalBytes) ? formatBytes(data.total || d.totalBytes) : d.size,
         progress: data.total ? Math.min(100, (data.downloaded / data.total) * 100) : d.progress,
         speed: speedStr,
         eta: etaStr,
-        connections: data.connections,
-        segmentsDone: data.segmentsDone,
-        segmentsTotal: data.segmentsTotal,
-        merging: data.merging
+        connections: data.connections ?? d.connections,
+        segmentsDone: data.segmentsDone ?? d.segmentsDone,
+        segmentsTotal: data.segmentsTotal ?? d.segmentsTotal,
+        merging: data.merging ?? d.merging
       } : d));
     });
 
     const unsubFinished = electronAPI.onDownloadEvent('finished', (data: any) => {
-      setDownloads(prev => prev.map(d => d.id === data.id ? { ...d, status: 'completed', progress: 100, speed: '0 KB/s', eta: 'Finished' } : d));
+      setDownloads(prev => prev.map(d => d.id === data.id ? { 
+        ...d, 
+        status: 'completed', 
+        progress: 100, 
+        speed: '0 KB/s', 
+        eta: 'Finished',
+        totalBytes: data.size || d.totalBytes,
+        size: (data.size || d.totalBytes) ? formatBytes(data.size || d.totalBytes) : d.size
+      } : d));
       toast({ title: 'Download Finished', description: `Download completed` });
       delete speedTrackingRef.current[data.id];
     });
@@ -266,7 +283,13 @@ function App() {
     });
 
     const unsubStarted = electronAPI.onDownloadEvent('started', (data: any) => {
-      setDownloads(prev => prev.map(d => d.id === data.id ? { ...d, totalBytes: data.size, status: 'downloading', speed: 'Starting...' } : d));
+      setDownloads(prev => prev.map(d => d.id === data.id ? { 
+        ...d, 
+        totalBytes: data.size || d.totalBytes, 
+        size: (data.size || d.totalBytes) ? formatBytes(data.size || d.totalBytes) : d.size,
+        status: 'downloading', 
+        speed: 'Starting...' 
+      } : d));
     });
 
     const unsubPaused = electronAPI.onDownloadEvent('paused', (data: any) => {
@@ -326,15 +349,42 @@ function App() {
   }, [isDialogMode]);
 
   if (isDialogMode) {
+    const activeDl = activeDialogDownloadId 
+      ? downloads.find(d => d.id === activeDialogDownloadId) 
+      : null;
+
+    if (activeDl) {
+      return (
+        <div className="h-screen w-screen bg-transparent overflow-hidden">
+          <DialogProgressView
+            download={activeDl}
+            onClose={() => {
+              if (electronAPI?.closeDialog) electronAPI.closeDialog();
+            }}
+            onPause={() => {
+              if (electronAPI?.pauseDownload) electronAPI.pauseDownload(activeDl.id);
+            }}
+            onResume={() => {
+              if (electronAPI?.resumeDownload) electronAPI.resumeDownload(activeDl.id);
+            }}
+            onCancel={() => {
+              if (electronAPI?.cancelDownload) electronAPI.cancelDownload(activeDl.id);
+            }}
+          />
+          <Toaster />
+        </div>
+      );
+    }
+
     return (
       <div className="h-screen w-screen bg-transparent overflow-hidden">
         <NewDownloadDialog
           url={pendingDownload?.url || ""}
           headers={pendingDownload?.headers}
           meta={pendingDownload?.meta}
+          defaultSavePath={settings?.defaultDownloadPath}
           onConfirm={(options: any) => handleAddDownload(pendingDownload?.url || "", options)}
           onCancel={() => {
-            const electronAPI = (window as any).electronAPI;
             if (electronAPI?.closeDialog) electronAPI.closeDialog();
           }}
         />
@@ -370,7 +420,6 @@ function App() {
           onAddDownload={handleAddDownload}
           onOpenAdvanced={openAdvancedTools}
           onPauseAll={async () => {
-            const electronAPI = (window as any).electronAPI;
             if (!electronAPI?.pauseDownload) return;
             // Pause all 'downloading' items
             const active = downloads.filter(d => d.status === 'downloading');
@@ -380,7 +429,6 @@ function App() {
             toast({ title: "Paused All", description: `Paused ${active.length} downloads` });
           }}
           onResumeAll={async () => {
-            const electronAPI = (window as any).electronAPI;
             if (!electronAPI?.resumeDownload) return;
             // Resume all 'paused' items
             const paused = downloads.filter(d => d.status === 'paused');
@@ -390,7 +438,6 @@ function App() {
             toast({ title: "Resumed All", description: `Resumed ${paused.length} downloads` });
           }}
           onCancelAll={async () => {
-            const electronAPI = (window as any).electronAPI;
             if (!electronAPI?.cancelDownload) return;
             // Cancel all active items
             const active = downloads.filter(d => d.status === 'downloading' || d.status === 'paused');
@@ -400,7 +447,6 @@ function App() {
             toast({ title: "Cancelled All", description: `Cancelled ${active.length} downloads` });
           }}
           onDeleteSelected={async () => {
-            const electronAPI = (window as any).electronAPI;
             if (selectedIds.size === 0) {
               toast({ title: "No Selection", description: "Please select items to delete" });
               return;
@@ -462,6 +508,9 @@ function App() {
               if (updated.darkMode) document.documentElement.classList.add('dark');
               else document.documentElement.classList.remove('dark');
             }
+            if (electronAPI?.refreshSettings) {
+              await electronAPI.refreshSettings();
+            }
             toast({ title: "Settings Saved", description: "Successfully updated settings." });
           } catch (e) {
             toast({ title: "Error", description: "Failed to update settings." });
@@ -476,6 +525,7 @@ function App() {
           size={pendingDownload.meta?.size}
           headers={pendingDownload.headers}
           meta={pendingDownload.meta}
+          defaultSavePath={settings?.defaultDownloadPath}
           onConfirm={(options: any) => {
             handleAddDownload(pendingDownload.url, options);
             setPendingDownload(null);
