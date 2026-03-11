@@ -10,32 +10,81 @@ chrome.runtime.onInstalled.addListener(() => {
 
 // 1. Download Intercept Filter
 const INTERCEPT_EXTENSIONS = [
-    // Original core
     ".exe", ".msi", ".zip", ".rar", ".7z", ".iso", ".tar", ".dmg", ".bin", ".mkv", ".mp4",
-    // Expanded User Requests
     ".3gp", ".aac", ".ace", ".aif", ".apk", ".arj", ".asf", ".avi", ".bz2", ".gz", ".gzip",
     ".img", ".lzh", ".m4a", ".m4v", ".mov", ".mp3", ".mpa", ".mpe", ".mpeg", ".mpg", ".msu",
     ".ogg", ".ogv", ".pdf", ".plj", ".pps", ".ppt", ".qt", ".r00", ".r01", ".r02", ".r10",
-    ".ra", ".rm", ".rmvb", ".sea", ".sit", ".sitx", ".tif", ".tiff", ".wav", ".wma", ".wmv", ".z"
+    ".ra", ".rm", ".rmvb", ".sea", ".sit", ".sitx", ".tif", ".tiff", ".wav", ".wma", ".wmv", ".z",
+    ".torrent", ".deb", ".rpm", ".pkg", ".crdownload"
 ];
+
+const INTERCEPT_MIMES = [
+    "application/x-msdownload", "application/x-msi", "application/zip", "application/x-7z-compressed",
+    "application/x-rar-compressed", "application/x-iso9660-image", "application/x-debian-package",
+    "application/x-redhat-package-manager", "application/octet-stream", "video/", "audio/",
+    "application/vnd.android.package-archive"
+];
+
+
+const INTERCEPT_EXCEPTIONS = [
+    "google.com", "gmail.com", "drive.google.com", "github.com", "dropbox.com", "onedrive.live.com"
+];
+
+
 
 // 2. Main Interceptor
 chrome.downloads.onCreated.addListener(async (item) => {
-    const { interceptEnabled } = await chrome.storage.local.get("interceptEnabled");
-    if (!interceptEnabled || item.state !== "in_progress") return;
+    handleInterception(item, "onCreated");
+});
 
-    // Check if URL matches targeted file types
-    const url = item.url.toLowerCase().split('?')[0];
-    const isTarget = INTERCEPT_EXTENSIONS.some(ext => url.endsWith(ext));
-    if (!isTarget) return;
+// 3. Secondary Catch (onDeterminingFilename) - Handles dynamic URLs where filename is known later
+chrome.downloads.onDeterminingFilename.addListener(async (item, suggest) => {
+    const intercepted = await handleInterception(item, "onDeterminingFilename");
+    if (intercepted) {
+        // Suggest a dummy name to satisfy the listener if we're cancelling anyway
+        suggest({ filename: item.filename, conflictAction: 'overwrite' });
+    }
+});
+
+async function handleInterception(item, triggerSource) {
+    const { interceptEnabled } = await chrome.storage.local.get("interceptEnabled");
+    if (!interceptEnabled || item.state !== "in_progress") return false;
+
+    // 0. Check for Exceptions (Allowlist)
+    try {
+        const url = new URL(item.url);
+        const domain = url.hostname.replace('www.', '');
+        if (INTERCEPT_EXCEPTIONS.some(ex => domain.endsWith(ex))) return false;
+    } catch (e) { }
+
+    // 1. Check by reported filename extension
+    const fileName = (item.filename || "").toLowerCase();
+    const urlPath = item.url.toLowerCase().split('?')[0];
+    const mime = (item.mime || "").toLowerCase();
+    
+    let shouldIntercept = INTERCEPT_EXTENSIONS.some(ext => fileName.endsWith(ext) || urlPath.endsWith(ext));
+
+    // 2. Check by Mime Type
+    if (!shouldIntercept) {
+        shouldIntercept = INTERCEPT_MIMES.some(m => mime.startsWith(m) || mime === m);
+    }
+
+    // 3. Strategic "Kidnapping": Intercept if it's a generic stream > 2MB
+    if (!shouldIntercept && mime === "application/octet-stream" && item.fileSize > 2 * 1024 * 1024) {
+        shouldIntercept = true;
+    }
+
+    if (!shouldIntercept) return false;
 
     // Don't intercept localhost or local file downloads
-    if (item.url.startsWith("http://127.0.0.1") || item.url.startsWith("http://localhost") || item.url.startsWith("file://")) return;
+    if (item.url.startsWith("http://127.0.0.1") || item.url.startsWith("http://localhost") || item.url.startsWith("file://") || item.url.startsWith("blob:")) return false;
+
+    console.log(`[Nexus] Intercepting (${triggerSource}):`, item.url, fileName);
 
     // Pause immediately to prevent browser from starting the data stream
     chrome.downloads.pause(item.id);
 
-    // Get cookies for the domain to ensure authenticated downloads work in Nexus
+    // Get cookies for the domain
     chrome.cookies.getAll({ url: item.url }, async (cookies) => {
         const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
@@ -51,7 +100,6 @@ chrome.downloads.onCreated.addListener(async (item) => {
                 source: "browser-interception"
             };
 
-            // Bridge to Nexus Desktop on dedicated port 4578
             const response = await fetch("http://127.0.0.1:4578/intercept", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -59,10 +107,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
             });
 
             if (response.ok) {
-                // Successfully handed off to Nexus, cancel browser download
                 chrome.downloads.cancel(item.id);
-
-                // Show a simple notification to the user
                 chrome.notifications.create({
                     type: 'basic',
                     iconUrl: 'icons/icon128.png',
@@ -73,11 +118,13 @@ chrome.downloads.onCreated.addListener(async (item) => {
                 chrome.downloads.resume(item.id);
             }
         } catch (e) {
-            console.error("[Nexus] Intercept failed (Nexus might be offline):", e);
             chrome.downloads.resume(item.id);
         }
     });
-});
+
+    return true;
+}
+
 
 // 7. Advanced Media Sniffer & Header Capture
 const MEDIA_EXTENSIONS = ['.mp4', '.m3u8', '.mpd', '.webm', '.ts', '.m4s', '.flv', '.aac', '.mp3', '.m4a'];
@@ -119,11 +166,15 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
             timestamp: Date.now()
         });
 
-        // Optional: Proactively report if it's a known media extension
-        if (MEDIA_EXTENSIONS.some(ext => details.url.toLowerCase().split('?')[0].endsWith(ext))) {
+        // Optional: Proactively report if it's a known media extension OR a social media page
+        const isMedia = MEDIA_EXTENSIONS.some(ext => details.url.toLowerCase().split('?')[0].endsWith(ext));
+        const isSocialPage = (details.url.includes('facebook.com') || details.url.includes('instagram.com') || details.url.includes('twitter.com') || details.url.includes('x.com') || details.url.includes('dailymotion.com')) && details.type === 'main_frame';
+        
+        if (isMedia || isSocialPage) {
             reportHeaders(details.url, headers);
         }
     },
+
     { urls: ["<all_urls>"] },
     ["requestHeaders", "extraHeaders"]
 );
@@ -294,28 +345,38 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "DOWNLOAD_VIDEO") {
         const url = msg.url || '';
-        const cached = headerCache.get(url);
+        
+        // Priority 1: Get from cache
+        let headers = (headerCache.get(url))?.headers || msg.headers || {};
+        
+        // Priority 2: Force fresh cookies for social media
+        chrome.cookies.getAll({ url: url }, (cookies) => {
+            if (cookies && cookies.length > 0) {
+                headers['cookie'] = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+            }
 
-        const payload = {
-            url,
-            filename: msg.filename || "video.mp4",
-            headers: (cached && cached.headers) ? cached.headers : (msg.headers || {}),
-            quality: msg.isInteractive ? "Select Quality..." : (msg.quality || "Unknown"),
-            type: msg.isStream ? "stream" : "file",
-            isYouTube: !!msg.isYouTube,
-            isAudioOnly: !!msg.isAudioOnly,
-            source: msg.isInteractive ? "browser-manual" : "browser-overlay"
-        };
+            const payload = {
+                url,
+                filename: msg.filename || "video.mp4",
+                headers: headers,
+                quality: msg.isInteractive ? "Select Quality..." : (msg.quality || "Unknown"),
+                type: msg.isStream ? "stream" : "file",
+                isYouTube: !!msg.isYouTube,
+                isAudioOnly: !!msg.isAudioOnly,
+                source: "browser-overlay"
+            };
 
-        fetch("http://127.0.0.1:4578/intercept", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-        })
+            fetch("http://127.0.0.1:4578/intercept", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            })
             .then(res => res.json())
             .then(data => sendResponse({ ok: true, data }))
             .catch(err => sendResponse({ ok: false, error: err.message }));
+        });
 
         return true;
+
     }
 });

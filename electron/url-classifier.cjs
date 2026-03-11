@@ -173,13 +173,23 @@ function resolveFilename(url, headInfo = {}, ext = '') {
     try {
         const parsed = new URL(url);
         const pathname = parsed.pathname;
+        
+        // Dailymotion CDN cleanup: manifest.m3u8 -> video_id
+        if (pathname.includes('/manifest/video/') && pathname.endsWith('.m3u8')) {
+            const m = pathname.match(/\/video\/([a-zA-Z0-9]+)\.m3u8/);
+            if (m) return sanitizeFilename(`${m[1]}${ext || '.mp4'}`);
+        }
+
         // Get the last segment, strip query params
         let base = pathname.split('/').filter(Boolean).pop() || '';
         if (base) {
             base = decodeURIComponent(base); // Decode %20 etc.
+            // If it's a generic word like 'manifest' or 'playlist', and it's from a known host, 
+            // the above DM check might have caught it, otherwise continue fallback.
+            
             // If it has no extension and we know one, add it
             if (ext && !base.includes('.')) base += ext;
-            if (base.length > 1) return sanitizeFilename(base);
+            if (base.length > 1 && !base.toLowerCase().startsWith('manifest')) return sanitizeFilename(base);
         }
 
         // 3. Fallback: host + timestamp
@@ -242,10 +252,32 @@ async function _classifyInternal(url, headers = {}) {
         site: null,
         isStream: false,
         requiresYtdl: false,
+        url: url, // Store original/normalized URL
     };
 
     let parsed;
     try {
+        // Normalize Dailymotion Embed URLs (but NOT player URLs which use player IDs)
+        if (url.includes('dailymotion.com/embed/video/')) {
+            const videoIdMatch = url.match(/\/video\/([a-zA-Z0-9]+)/);
+            if (videoIdMatch) {
+                const videoId = videoIdMatch[1];
+                url = `https://www.dailymotion.com/video/${videoId}`;
+                result.url = url;
+            }
+        }
+        // For player URLs, only normalize if 'video' param is present
+        else if (url.includes('geo.dailymotion.com/player/')) {
+            try {
+                const u = new URL(url);
+                const videoId = u.searchParams.get('video');
+                if (videoId) {
+                    url = `https://www.dailymotion.com/video/${videoId}`;
+                    result.url = url;
+                }
+            } catch(e) {}
+        }
+
         parsed = new URL(url);
     } catch (e) {
         result.filename = `invalid_url_${Date.now()}`;

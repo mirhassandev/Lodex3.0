@@ -57,25 +57,19 @@ function runYtdlpJson(url, opts = {}) {
             '--no-video-multistreams',
             '--no-playlist',
             '--socket-timeout', '10',
-            '--add-header', 'referer:youtube.com',
-            '--add-header', 'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
         ];
 
-        if (!opts.playlist) {
-            args.push('--no-playlist');
-        }
+        // Default Headers
+        const finalHeaders = {
+            'Referer': 'https://www.google.com',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            ...opts.headers
+        };
 
-        if (opts.extraArgs) {
-            args.push(...opts.extraArgs);
-        }
-
-        if (opts.headers) {
-            Object.entries(opts.headers).forEach(([key, value]) => {
-                // Skips if User-Agent or Referer already set above
-                if (['referer', 'user-agent'].includes(key.toLowerCase())) return;
-                if (value) args.push('--add-header', `${key}:${value}`);
-            });
-        }
+        // Apply Headers
+        Object.entries(finalHeaders).forEach(([key, value]) => {
+            if (value) args.push('--add-header', `${key}:${value}`);
+        });
 
         args.push(url);
 

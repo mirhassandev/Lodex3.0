@@ -49,7 +49,7 @@ const PRESETS = {
     ext: '.mp3',
   },
   dailymotion: {
-    hosts: ['dailymotion.com', 'www.dailymotion.com', 'dai.ly'],
+    hosts: ['dailymotion.com', 'www.dailymotion.com', 'dai.ly', 'dmcdn.net'],
     protocol: 'ytdl',
     type: 'video',
     requiresYtdl: true,
@@ -70,7 +70,7 @@ const PRESETS = {
     ext: '.mp4',
   },
   facebook: {
-    hosts: ['facebook.com', 'www.facebook.com', 'fb.watch', 'fb.com'],
+    hosts: ['facebook.com', 'www.facebook.com', 'fb.watch', 'fb.com', 'fbcdn.net'],
     protocol: 'ytdl',
     type: 'video',
     requiresYtdl: true,

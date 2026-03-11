@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Download } from "lucide-react";
 import { Sidebar } from "@/components/layout/Sidebar";
+import { TitleBar } from "@/components/layout/TitleBar";
 import { Toolbar } from "@/components/downloads/Toolbar";
 import { DownloadList } from "@/components/downloads/DownloadList";
 import { mockDownloads, DownloadItem, FileType, getFileType, DownloadStatus } from "@/lib/mock-data";
@@ -344,6 +345,10 @@ function App() {
   useEffect(() => {
     if (isDialogMode) {
       document.documentElement.classList.add('dialog-mode');
+      const dlId = params.get("id");
+      if (dlId) {
+        setActiveDialogDownloadId(dlId);
+      }
     } else {
       document.documentElement.classList.remove('dialog-mode');
     }
@@ -417,8 +422,9 @@ function App() {
       />
 
       <main className="flex-1 flex flex-col min-w-0">
-        <Toolbar
-          onAddDownload={handleAddDownload}
+      <TitleBar />
+      <Toolbar
+        onAddDownload={handleAddDownload}
           onOpenAdvanced={openAdvancedTools}
           onPauseAll={async () => {
             if (!electronAPI?.pauseDownload) return;

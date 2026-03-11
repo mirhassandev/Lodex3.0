@@ -289,7 +289,7 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
                     </div>
                 </div>
 
-                {/* macOS Window Controls - Moved to Right */}
+                {/* macOS Window Controls - Moved to Far Right */}
                 <div className="flex gap-2 ml-auto" style={{ WebkitAppRegion: 'no-drag' } as any}>
                     <button
                         onClick={() => electronAPI?.minimize()}
@@ -301,10 +301,6 @@ export function NewDownloadDialog({ url, filename: initialFilename, size, header
                         className="w-3 h-3 rounded-full bg-[#ff5f57] hover:bg-[#ff5f57cc] border border-[#e0443e] transition-colors"
                         title="Close"
                     />
-                </div>
-
-                <div className="ml-auto flex items-center gap-4">
-                    <span className="text-[10px] text-white/30 font-bold uppercase tracking-widest">v1.2.0</span>
                 </div>
             </div>
 

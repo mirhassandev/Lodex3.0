@@ -236,3 +236,12 @@
   transition: width 0.2s;
   box-shadow: 0 0 5px var(--color-primary);
 }
+
+/* Frameless Window Support */
+.title-drag {
+  -webkit-app-region: drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}

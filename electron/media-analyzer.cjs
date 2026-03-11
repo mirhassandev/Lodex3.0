@@ -27,10 +27,13 @@ async function analyzeMedia(url, classification = null, headers = {}) {
         ? classification
         : await classify(url, headers);
 
+    // Use normalized URL if provided by classifier
+    const targetUrl = meta.url || url;
+
     // ── YouTube / social media — delegate to yt-dlp ───────────────────────────
     if (meta.requiresYtdl || meta.protocol === 'ytdl' || meta.isYouTube) {
         try {
-            const data = await getMetadata(url, { headers });
+            const data = await getMetadata(targetUrl, { headers });
 
             if (data.isPlaylist) {
                 return {
@@ -73,13 +76,13 @@ async function analyzeMedia(url, classification = null, headers = {}) {
     }
 
     // ── HLS stream ─────────────────────────────────────────────────────────────
-    if (meta.protocol === 'hls' || meta.isStream && url.toLowerCase().includes('m3u8')) {
+    if (meta.protocol === 'hls' || meta.isStream && targetUrl.toLowerCase().includes('m3u8')) {
         try {
-            const data = await parseHLS(url, headers);
-
+            const data = await parseHLS(targetUrl, headers);
+ 
             return {
                 source: 'hls',
-                title: _titleFromUrl(url),
+                title: _titleFromUrl(targetUrl),
                 isPlaylist: false,
                 thumbnail: null,
                 uploader: null,
@@ -97,18 +100,18 @@ async function analyzeMedia(url, classification = null, headers = {}) {
             };
         } catch (e) {
             console.error('[MediaAnalyzer] HLS parse failed:', e.message);
-            return _fallbackResult(url, meta, e.message);
+            return _fallbackResult(targetUrl, meta, e.message);
         }
     }
-
+ 
     // ── DASH stream ────────────────────────────────────────────────────────────
-    if (meta.protocol === 'dash' || meta.isStream && url.toLowerCase().includes('.mpd')) {
+    if (meta.protocol === 'dash' || meta.isStream && targetUrl.toLowerCase().includes('.mpd')) {
         try {
-            const data = await parseDASH(url, headers);
-
+            const data = await parseDASH(targetUrl, headers);
+ 
             return {
                 source: 'dash',
-                title: _titleFromUrl(url),
+                title: _titleFromUrl(targetUrl),
                 isPlaylist: false,
                 thumbnail: null,
                 uploader: null,
@@ -131,14 +134,14 @@ async function analyzeMedia(url, classification = null, headers = {}) {
             };
         } catch (e) {
             console.error('[MediaAnalyzer] DASH parse failed:', e.message);
-            return _fallbackResult(url, meta, e.message);
+            return _fallbackResult(targetUrl, meta, e.message);
         }
     }
 
     // ── Direct file — return single quality option ─────────────────────────────
     return {
         source: 'direct',
-        title: meta.filename || _titleFromUrl(url),
+        title: meta.filename || _titleFromUrl(targetUrl),
         isPlaylist: false,
         thumbnail: null,
         uploader: null,
@@ -148,7 +151,7 @@ async function analyzeMedia(url, classification = null, headers = {}) {
             type: 'direct',
             quality: 'Original',
             label: `Direct File (${meta.ext || ''})`,
-            url,
+            url: targetUrl,
             filesize: meta.size || 0,
             formatId: 'direct',
             ext: meta.ext,
@@ -180,9 +183,10 @@ function _formatDuration(secs) {
 }
 
 function _fallbackResult(url, meta, errorMsg) {
+    const targetUrl = meta.url || url;
     return {
         source: 'fallback',
-        title: meta.filename || _titleFromUrl(url),
+        title: meta.filename || _titleFromUrl(targetUrl),
         error: errorMsg,
         isPlaylist: false,
         thumbnail: null,
@@ -193,7 +197,7 @@ function _fallbackResult(url, meta, errorMsg) {
             type: 'direct',
             quality: 'Original',
             label: 'Direct Download',
-            url,
+            url: targetUrl,
             filesize: meta.size || 0,
             formatId: 'direct',
         }],

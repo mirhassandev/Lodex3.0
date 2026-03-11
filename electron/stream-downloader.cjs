@@ -10,10 +10,9 @@
 const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const http = require('http');
 const { spawn } = require('child_process');
 const { parseString } = require('xml2js');
+const { requestWithRedirect, fetchTextWithRedirect, fetchBufferWithRedirect } = require('./request-utils.cjs');
 
 // Use dynamic import for m3u8-parser (ESM module)
 let M3U8Parser;
@@ -34,16 +33,15 @@ try {
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
-function fetchText(url, headers = {}) {
-    return new Promise((resolve, reject) => {
-        const lib = url.startsWith('https') ? https : http;
-        const options = { headers: { 'User-Agent': 'Mozilla/5.0', ...headers } };
-        lib.get(url, options, (res) => {
-            let data = '';
-            res.on('data', (chunk) => (data += chunk));
-            res.on('end', () => resolve(data));
-        }).on('error', reject);
-    });
+async function fetchText(url, headers = {}) {
+    const finalHeaders = { ...headers };
+    if (!finalHeaders.Referer && !finalHeaders.referer) {
+        try {
+            const u = new URL(url);
+            finalHeaders.Referer = `${u.protocol}//${u.host}/`;
+        } catch (e) {}
+    }
+    return fetchTextWithRedirect(url, finalHeaders);
 }
 
 function resolveSegmentUrl(baseUrl, segmentUri) {
@@ -61,18 +59,17 @@ function resolveSegmentUrl(baseUrl, segmentUri) {
 
 async function downloadBytesWithRetry(url, headers = {}, maxRetries = 5) {
     let delay = 500;
+    const finalHeaders = { ...headers };
+    if (!finalHeaders.Referer && !finalHeaders.referer) {
+        try {
+            const u = new URL(url);
+            finalHeaders.Referer = `${u.protocol}//${u.host}/`;
+        } catch (e) {}
+    }
+
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
-            return await new Promise((resolve, reject) => {
-                const lib = url.startsWith('https') ? https : http;
-                const options = { headers: { 'User-Agent': 'Mozilla/5.0', ...headers } };
-                lib.get(url, options, (res) => {
-                    const chunks = [];
-                    res.on('data', (chunk) => chunks.push(chunk));
-                    res.on('end', () => resolve(Buffer.concat(chunks)));
-                    res.on('error', reject);
-                }).on('error', reject);
-            });
+            return await fetchBufferWithRedirect(url, finalHeaders);
         } catch (e) {
             if (attempt === maxRetries) throw e;
             await new Promise((r) => setTimeout(r, delay));
@@ -85,7 +82,7 @@ async function downloadBytesWithRetry(url, headers = {}, maxRetries = 5) {
 
 async function inspectHLSPlaylist(url, headers = {}) {
     const Parser = await getM3U8Parser();
-    const text = await fetchText(url, headers);
+    const { text, finalUrl } = await fetchText(url, headers);
     const parser = new Parser();
     parser.push(text);
     parser.end();
@@ -104,14 +101,14 @@ async function inspectHLSPlaylist(url, headers = {}) {
             const height = res.height || 0;
             const bw = attrs.BANDWIDTH || 0;
             return {
-                url: resolveSegmentUrl(url, p.uri),
+                url: resolveSegmentUrl(finalUrl, p.uri),
                 height,
                 label: height ? `${height}p` : `${Math.round(bw / 1000)}kbps`,
                 bandwidth: bw,
             };
         }).sort((a, b) => b.height - a.height);
 
-        return { type: 'master', variants, isLive, playlistType };
+        return { type: 'master', variants, isLive, playlistType, finalUrl };
     }
 
     // Media playlist — estimate segment count and size
@@ -139,7 +136,7 @@ async function inspectHLSPlaylist(url, headers = {}) {
 // ─── DASH Manifest Inspector ──────────────────────────────────────────────────
 
 async function inspectDASHManifest(url, headers = {}) {
-    const text = await fetchText(url, headers);
+    const { text, finalUrl } = await fetchText(url, headers);
     return new Promise((resolve, reject) => {
         parseString(text, { explicitArray: false }, (err, result) => {
             if (err) return reject(err);
@@ -168,7 +165,7 @@ async function inspectDASHManifest(url, headers = {}) {
                     }));
                 }).sort((a, b) => b.height - a.height);
 
-                resolve({ type: 'dash', variants, videoSets, audioSets });
+                resolve({ type: 'dash', variants, videoSets, audioSets, finalUrl });
             } catch (e) {
                 reject(e);
             }
@@ -227,11 +224,12 @@ class StreamTask extends EventEmitter {
 
     async _startHLS() {
         const Parser = await getM3U8Parser();
-        const text = await fetchText(this.url, this.customHeaders);
+        const { text, finalUrl } = await fetchText(this.url, this.customHeaders);
         const parser = new Parser();
         parser.push(text);
         parser.end();
         const manifest = parser.manifest;
+        let manifestFinalUrl = finalUrl;
 
         // Live stream detection
         if (!manifest.endList && !manifest.playlistType) {
@@ -251,16 +249,19 @@ class StreamTask extends EventEmitter {
                     .filter(p => p.attributes && p.attributes.RESOLUTION)
                     .sort((a, b) => (b.attributes.RESOLUTION.height || 0) - (a.attributes.RESOLUTION.height || 0));
                 const best = sorted[0] || manifest.playlists[0];
-                mediaUrl = resolveSegmentUrl(this.url, best.uri);
+                mediaUrl = resolveSegmentUrl(manifestFinalUrl, best.uri);
             }
 
             // Parse the media playlist
-            const mediaText = await fetchText(mediaUrl, this.customHeaders);
+            const { text: mediaText, finalUrl: mediaFinalUrl } = await fetchText(mediaUrl, this.customHeaders);
+            mediaUrl = mediaFinalUrl; // Update to final destination
             const mediaParser = new Parser();
             mediaParser.push(mediaText);
             mediaParser.end();
             manifest.segments = mediaParser.manifest.segments;
         }
+
+        console.log(`[StreamTask] HLS Parsing finished. Master Playlists: ${manifest.playlists ? manifest.playlists.length : 0}, Media segments: ${manifest.segments ? manifest.segments.length : 0}, Final URL: ${mediaUrl}`);
 
         const rawSegments = manifest.segments || [];
 
@@ -368,7 +369,7 @@ class StreamTask extends EventEmitter {
         // Skip already done segments from previous run
         if (seg.done && fs.existsSync(segPath)) return;
 
-        const data = await downloadBytesWithRetry(seg.url, this.customHeaders);
+        const { buffer: data } = await downloadBytesWithRetry(seg.url, this.customHeaders);
 
         fs.writeFileSync(segPath, data);
         seg.done = true;
@@ -441,17 +442,28 @@ class StreamTask extends EventEmitter {
 
     _runFFmpegDirect(playlistUrl, outPath, onDone) {
         // Build header string for FFmpeg
-        let headerStr = '';
-        if (this.customHeaders) {
-            headerStr = Object.entries(this.customHeaders)
-                .map(([k, v]) => `${k}: ${v}`)
-                .join('\r\n') + '\r\n';
+        const finalHeaders = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            ...this.customHeaders
+        };
+
+        // Inject Referer if missing
+        if (!finalHeaders.Referer && !finalHeaders.referer) {
+            try {
+                const u = new URL(playlistUrl);
+                finalHeaders.Referer = `${u.protocol}//${u.host}/`;
+            } catch(e) {}
         }
+
+        let headerStr = '';
+        headerStr = Object.entries(finalHeaders)
+            .map(([k, v]) => `${k}: ${v}`)
+            .join('\r\n') + '\r\n';
 
         const args = [
             '-y',
             '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-            ...(headerStr ? ['-headers', headerStr] : []),
+            '-headers', headerStr,
             '-i', playlistUrl,
             '-c', 'copy',
             outPath
@@ -598,10 +610,26 @@ class StreamTask extends EventEmitter {
     _cleanup() {
         try {
             fs.rmSync(this.tmpDir, { recursive: true, force: true });
-            fs.unlink(this.metaPath, () => { });
+            if (fs.existsSync(this.metaPath)) {
+                fs.unlinkSync(this.metaPath);
+            }
         } catch (e) {
             console.warn('[StreamTask] Cleanup failed:', e.message);
         }
+    }
+
+    cancel() {
+        this.aborted = true;
+        this.completed = true; // Prevents speed ticker from lingering
+        if (this.speedInterval) clearInterval(this.speedInterval);
+        
+        // Ensure child processes (like FFmpeg) and temp files are forcefully cleaned
+        if (this.ffmpegProcess) {
+            this.ffmpegProcess.kill('SIGKILL');
+        }
+        
+        this._cleanup();
+        this.emit('error', new Error('Task was canceled.'));
     }
 }
 

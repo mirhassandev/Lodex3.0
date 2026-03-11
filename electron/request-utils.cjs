@@ -63,8 +63,19 @@ async function requestWithRedirect(url, options = {}, redirectCount = 0) {
                     nextUrl = new URL(nextUrl, urlObj.href).href;
                 }
 
+                // SECURITY: Remove Sensitive Headers on Cross-Domain Redirects
+                const nextUrlObj = new URL(nextUrl);
+                const nextOptions = { ...options };
+                if (nextUrlObj.host !== urlObj.host) {
+                    const filteredHeaders = { ...options.headers };
+                    delete filteredHeaders['authorization'];
+                    delete filteredHeaders['cookie'];
+                    // We keep Referer and User-Agent as they are usually required for CDNs
+                    nextOptions.headers = filteredHeaders;
+                }
+
                 try {
-                    const redirectedRes = await requestWithRedirect(nextUrl, options, redirectCount + 1);
+                    const redirectedRes = await requestWithRedirect(nextUrl, nextOptions, redirectCount + 1);
                     resolve(redirectedRes);
                 } catch (err) {
                     reject(err);
@@ -116,4 +127,42 @@ async function headWithRedirect(url, headers = {}, timeout = 10000) {
     };
 }
 
-module.exports = { requestWithRedirect, headWithRedirect };
+/**
+ * Fetch text content with redirect following.
+ */
+async function fetchTextWithRedirect(url, headers = {}, timeout = 10000) {
+    const res = await requestWithRedirect(url, { method: 'GET', headers, timeout });
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        throw new Error(`HTTP Error ${res.statusCode} while fetching text`);
+    }
+
+    const finalUrl = res.finalUrl;
+    return new Promise((resolve, reject) => {
+        let data = '';
+        res.on('data', chunk => data += chunk.toString());
+        res.on('end', () => resolve({ text: data, finalUrl }));
+        res.on('error', reject);
+    });
+}
+
+/**
+ * Fetch buffer content with redirect following.
+ */
+async function fetchBufferWithRedirect(url, headers = {}, timeout = 30000) {
+    const res = await requestWithRedirect(url, { method: 'GET', headers, timeout });
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        throw new Error(`HTTP Error ${res.statusCode} while fetching buffer`);
+    }
+
+    const finalUrl = res.finalUrl;
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => resolve({ buffer: Buffer.concat(chunks), finalUrl }));
+        res.on('error', reject);
+    });
+}
+
+module.exports = { requestWithRedirect, headWithRedirect, fetchTextWithRedirect, fetchBufferWithRedirect };

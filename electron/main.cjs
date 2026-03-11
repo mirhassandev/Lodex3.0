@@ -12,6 +12,7 @@ const electron = require('electron');
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage } = electron;
 
 let appTray = null;
+let downloadTray = null;
 let isQuitting = false;
 
 if (!app) {
@@ -140,13 +141,18 @@ function startInterceptServer() {
 
         if (req.method === 'POST' && req.url === '/intercept') {
           console.log('[Intercept] Link Intercepted:', data.url, 'Source:', data.source);
-          showNewDownloadDialog(data.source || 'browser-capture', data.url, {
-            referer: data.referrer,
-            'User-Agent': data.userAgent,
-            Cookie: data.cookies,
-            ...data
-          });
+          
+          // Flatten headers: prioritize explicit data.headers object from extension payload
+          const combinedHeaders = {
+            'User-Agent': data.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
+            'Referer': data.referrer || data.url,
+            'Cookie': data.cookies || '',
+            ...(data.headers || {}) // Merge any nested headers (idm-style payload)
+          };
+
+          showNewDownloadDialog(data.source || 'browser-capture', data.url, combinedHeaders);
         }
+
         else if (req.method === 'POST' && req.url === '/media-detected') {
           // Log only; passive detection should not interrupt the user with a modal
           console.log('[Media] Stream Detected (Passive):', data.url);
@@ -199,11 +205,18 @@ function showNewDownloadDialog(source, url, meta = {}) {
     },
   });
 
+  // Tag window for management
+  dialogWindow.isDialog = true;
+
+
   const baseUrl = process.env.NODE_ENV === 'production'
     ? `file://${path.join(__dirname, '..', 'client', 'dist', 'index.html')}`
     : 'http://localhost:5000'; // Ensure correct vite port
 
-  const dialogUrl = `${baseUrl}?dialog=true`;
+  const dialogUrl = (meta && meta.id) 
+    ? `${baseUrl}?dialog=true&id=${meta.id}`
+    : `${baseUrl}?dialog=true`;
+    
   dialogWindow.loadURL(dialogUrl);
 
   dialogWindow.once('ready-to-show', () => {
@@ -211,8 +224,11 @@ function showNewDownloadDialog(source, url, meta = {}) {
   });
 
   dialogWindow.webContents.on('did-finish-load', () => {
-    dialogWindow.webContents.send('download-detected', source, url, headers, meta);
+    if (!meta.id) {
+      dialogWindow.webContents.send('download-detected', source, url, headers, meta);
+    }
   });
+
 
   dialogWindow.on('blur', () => {
     if (!dialogWindow.isDestroyed()) {
@@ -276,7 +292,82 @@ dm.on('download', ({ id, event, payload }) => {
       body: JSON.stringify(updateData)
     }).catch(e => console.error('[Database sync error]', e.message));
   }
+
+  // Dual Tray Update
+  updateDownloadTray();
 });
+
+function updateDownloadTray() {
+  const activeTasks = Array.from(dm.tasks.values()).filter(t => t.status === 'downloading' || t.status === 'queued');
+  
+  if (activeTasks.length > 0) {
+    if (!downloadTray) {
+      const iconPath = path.join(__dirname, '..', 'client', 'public', 'download_tray2.0.png');
+      downloadTray = new Tray(nativeImage.createFromPath(iconPath));
+      downloadTray.setToolTip('Nexus Download Engine');
+    }
+
+    // Build Transfer-specific Menu
+    const menuItems = [
+      { label: 'Restore all download windows', click: () => {
+          BrowserWindow.getAllWindows().forEach(win => {
+            if (win.isDialog && !win.isDestroyed()) {
+              if (win.isVisible() === false) {
+                win.show();
+              }
+              win.focus();
+            }
+
+          });
+      }},
+      { type: 'separator' }
+    ];
+
+
+    activeTasks.slice(0, 5).forEach(task => {
+      const filename = path.basename(task.savePath || task.outPath || 'Unknown');
+      const denominator = task.size || 0;
+      const progressNum = denominator > 0 ? (task.downloaded / denominator) * 100 : 0;
+      const progress = `${progressNum.toFixed(1)}%`;
+      menuItems.push({ 
+        label: `${progress} ${filename}`, 
+        click: () => openDownloadProgress(task.id)
+      });
+    });
+
+
+    if (activeTasks.length > 5) {
+      menuItems.push({ label: `...and ${activeTasks.length - 5} more`, enabled: false });
+    }
+
+    downloadTray.setContextMenu(Menu.buildFromTemplate(menuItems));
+    } else {
+      if (downloadTray) {
+        downloadTray.destroy();
+        downloadTray = null;
+      }
+    }
+  }
+
+
+
+function openDownloadProgress(id) {
+  // 1. Check if a window for this ID is already open
+  const existing = BrowserWindow.getAllWindows().find(win => win.activeDownloadId === id);
+  if (existing) {
+    existing.show();
+    existing.focus();
+    return;
+  }
+
+  // 2. Otherwise open a new dialog in progress mode
+  const task = dm.tasks.get(id);
+  if (task) {
+    showNewDownloadDialog('manual', task.url, { id: task.id });
+  }
+}
+
+
 
 function waitForServer(url, timeout = 30000) {
   const start = Date.now();
@@ -328,6 +419,9 @@ async function createWindow() {
     width: 1400,
     height: 900,
     show: false,
+    frame: false,
+    autoHideMenuBar: true,
+    icon: path.join(__dirname, '..', 'client', 'public', 'logo2.0.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -394,7 +488,7 @@ app.on('ready', async () => {
   console.log('[Electron] App ready event fired');
 
   // Build System Tray
-  const iconPath = path.join(__dirname, '..', 'client', 'public', 'favicon.png');
+  const iconPath = path.join(__dirname, '..', 'client', 'public', 'logo2.0.png');
   let trayIcon;
   try {
     trayIcon = nativeImage.createFromPath(iconPath);
@@ -469,6 +563,17 @@ ipcMain.on('window/minimize', (event) => {
 ipcMain.on('window/close', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (win) win.close();
+});
+
+ipcMain.on('window/maximize', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) {
+    if (win.isMaximized()) {
+      win.unmaximize();
+    } else {
+      win.maximize();
+    }
+  }
 });
 
 ipcMain.on('dialog/close', (event) => {
@@ -559,11 +664,17 @@ ipcMain.handle('dialog/select-folder', async () => {
 // Stream quality inspection IPC
 const { inspectHLSPlaylist, inspectDASHManifest } = require('./stream-downloader.cjs');
 const { classify } = require('./url-classifier.cjs');
+const { getYtdlpPath } = require('./ytdlp-wrapper.cjs');
 
-ipcMain.handle('stream/get-info', async (_event, url, headers = {}) => {
+
+ipcMain.handle('stream/get-info', async (_event, url, providedHeaders = {}) => {
   try {
     const isHLS = url.includes('.m3u8') || url.includes('m3u8?');
     const isDASH = url.includes('.mpd') || url.includes('mpd?');
+
+    // Merge captured headers if available
+    const captured = capturedHeaders.get(url) || {};
+    const headers = { ...captured, ...providedHeaders };
 
     if (isHLS) {
       const info = await inspectHLSPlaylist(url, headers);
@@ -580,20 +691,63 @@ ipcMain.handle('stream/get-info', async (_event, url, headers = {}) => {
 });
 
 // URL Classifier IPC — used by React UI to pre-populate download dialog
-ipcMain.handle('url/classify', async (_event, url, headers = {}) => {
+ipcMain.handle('url/classify', async (_event, url, providedHeaders = {}) => {
   try {
+    // Merge captured headers if available
+    const captured = capturedHeaders.get(url) || {};
+    const headers = { ...captured, ...providedHeaders };
+    
     const meta = await classify(url, headers);
     return { ok: true, ...meta };
   } catch (e) {
     return { ok: false, message: e.message };
   }
 });
+ipcMain.handle('system/get-disk-info', async (_event, folderPath) => {
+  return new Promise((resolve) => {
+    // Default to app's partition if no path
+    const driveLetter = (folderPath || __dirname).substring(0, 1).toUpperCase();
+    
+    // Using wmic as a standard Windows way to get disk metrics
+    exec(`wmic logicaldisk where "DeviceID='${driveLetter}:'" get FreeSpace,Size /value`, (err, stdout) => {
+      if (err) {
+        console.error('[DiskInfo] Error:', err);
+        return resolve({ free: 0, total: 0, used: 0, percent: 0 });
+      }
+
+      const lines = stdout.split('\n');
+      let free = 0;
+      let total = 0;
+
+      lines.forEach(line => {
+        if (line.includes('FreeSpace=')) free = parseInt(line.split('=')[1]);
+        if (line.includes('Size=')) total = parseInt(line.split('=')[1]);
+      });
+
+      const used = total - free;
+      const percent = total > 0 ? Math.round((used / total) * 100) : 0;
+
+      resolve({
+        free,
+        total,
+        used,
+        percent,
+        drive: driveLetter
+      });
+    });
+  });
+});
+
 
 // Media Analyzer IPC — returns full quality options for quality selector UI
 const { analyzeMedia } = require('./media-analyzer.cjs');
 
-ipcMain.handle('media/analyze', async (_event, url, classification = null, headers = {}) => {
+ipcMain.handle('media/analyze', async (_event, url, classification = null, providedHeaders = {}) => {
   try {
+    // Merge captured headers if available
+    const captured = capturedHeaders.get(url) || {};
+    const headers = { ...captured, ...providedHeaders };
+
     const result = await analyzeMedia(url, classification, headers);
     return { ok: true, ...result };
   } catch (e) {
@@ -609,22 +763,41 @@ ipcMain.handle('youtube/get-info', async (_event, url) => {
   console.log('[IPC] YouTube info requested:', url);
   try {
     const { spawn } = require('child_process');
-    const ytpPath = path.join(__dirname, '..', 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp.exe');
+    const ytpPath = getYtdlpPath();
+
 
     return new Promise((resolve) => {
-      const subprocess = spawn(ytpPath, [
+      const args = [
         url,
         '--dump-json',
         '--no-warnings',
         '--flat-playlist',
         '--no-check-certificate',
         '--quiet',
-        '--no-video-multistreams', // Faster for simple metadata
-        '--no-playlist', // Force no playlist expansion unless explicitly needed
-        '--socket-timeout', '10',
-        '--add-header', 'referer:youtube.com',
-        '--add-header', 'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
-      ]);
+        '--no-video-multistreams',
+        '--no-playlist',
+        '--socket-timeout', '10'
+      ];
+
+      // Inject Captured Headers (Cookies/Auth) if available
+      const savedHeaders = capturedHeaders.get(url);
+      if (savedHeaders) {
+        Object.entries(savedHeaders).forEach(([key, value]) => {
+          if (value) args.push('--add-header', `${key}:${value}`);
+        });
+      } else {
+        // Fallback defaults if no headers captured
+        try {
+          const u = new URL(url);
+          args.push('--add-header', `referer:${u.protocol}//${u.host}/`);
+        } catch {
+          args.push('--add-header', 'referer:https://www.google.com/');
+        }
+        args.push('--add-header', 'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
+      }
+
+      const subprocess = spawn(ytpPath, args);
+
 
       let stdout = '';
       let stderr = '';
@@ -643,14 +816,18 @@ ipcMain.handle('youtube/get-info', async (_event, url) => {
           try {
             const info = JSON.parse(stdout);
             const title = info.title;
-            // Extract resolutions safely
             const formats = info.formats || [];
+
+            // Robust resolution extraction
             const resolutions = [...new Set(formats
-              .filter(f => f.vcodec !== 'none' && f.height)
+              .filter(f => (f.vcodec !== 'none' || f.acodec !== 'none') && f.height)
               .map(f => f.height))]
               .sort((a, b) => b - a);
 
-            resolve({ ok: true, title, resolutions: resolutions.length > 0 ? resolutions : [1080, 720, 480, 360] });
+            const bestResolutions = resolutions.length > 0 ? resolutions : [1080, 720, 480, 360];
+
+            resolve({ ok: true, title, resolutions: bestResolutions, formats });
+
           } catch (e) {
             resolve({ ok: false, message: 'Parse error' });
           }

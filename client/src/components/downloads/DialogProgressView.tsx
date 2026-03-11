@@ -65,7 +65,7 @@ export function DialogProgressView({ download, onClose, onPause, onResume, onCan
                 className="flex items-center justify-between mb-4 pb-2 border-b border-border cursor-move"
             >
                 <div className="flex items-center gap-2">
-                    <img src="./icon.png" className="w-4 h-4 opacity-80" alt="" onError={(e) => e.currentTarget.style.display = 'none'} />
+                    <img src="/logo2.0.png" className="w-4 h-4 opacity-100" alt="" onError={(e) => e.currentTarget.style.display = 'none'} />
                     <h3 className="m-0 text-[14px] font-medium text-foreground p-0 border-none" style={{ WebkitAppRegion: 'no-drag' } as any}>
                         Download Progress
                     </h3>

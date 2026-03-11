@@ -20,9 +20,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectFolder: () => ipcRenderer.invoke('dialog/select-folder'),
   closeDialog: () => ipcRenderer.send('dialog/close'),
   minimize: () => ipcRenderer.send('window/minimize'),
+  maximize: () => ipcRenderer.send('window/maximize'),
   close: () => ipcRenderer.send('window/close'),
   refreshSettings: () => ipcRenderer.invoke('settings/refresh'),
   isDialogOpen: (id) => ipcRenderer.invoke('is-dialog-open', id),
+  getDiskInfo: (folderPath) => ipcRenderer.invoke('system/get-disk-info', folderPath),
   onDownloadDetected: (cb) => {
     ipcRenderer.on('download-detected', (_e, source, url, headers, meta) => cb(source, url, headers, meta));
     return () => ipcRenderer.removeAllListeners('download-detected');

@@ -6,29 +6,19 @@
 
 'use strict';
 
-const https = require('https');
-const http = require('http');
-
-function fetchText(url, headers = {}) {
-    return new Promise((resolve, reject) => {
-        const lib = url.startsWith('https') ? https : http;
-        const req = lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0', ...headers } }, (res) => {
-            let data = '';
-            res.on('data', c => data += c);
-            res.on('end', () => resolve(data));
-        });
-        req.setTimeout(8000, () => { req.destroy(); reject(new Error('HLS fetch timeout')); });
-        req.on('error', reject);
-    });
-}
+const { fetchTextWithRedirect } = require('../request-utils.cjs');
 
 function resolveUrl(base, uri) {
     if (!uri) return base;
     if (uri.startsWith('http://') || uri.startsWith('https://')) return uri;
-    const b = new URL(base);
-    if (uri.startsWith('/')) return `${b.protocol}//${b.host}${uri}`;
-    const basePath = b.pathname.substring(0, b.pathname.lastIndexOf('/') + 1);
-    return `${b.protocol}//${b.host}${basePath}${uri}`;
+    try {
+        const b = new URL(base);
+        if (uri.startsWith('/')) return `${b.protocol}//${b.host}${uri}`;
+        const basePath = b.pathname.substring(0, b.pathname.lastIndexOf('/') + 1);
+        return `${b.protocol}//${b.host}${basePath}${uri}`;
+    } catch (e) {
+        return uri;
+    }
 }
 
 /**
@@ -141,18 +131,26 @@ function parseMediaPlaylist(text, baseUrl) {
  * @returns {Promise<object>}
  */
 async function parseHLS(url, headers = {}) {
-    const text = await fetchText(url, headers);
+    const finalHeaders = { ...headers };
+    if (!finalHeaders.Referer && !finalHeaders.referer) {
+        try {
+            const u = new URL(url);
+            finalHeaders.Referer = `${u.protocol}//${u.host}/`;
+        } catch (e) {}
+    }
+
+    const { text, finalUrl } = await fetchTextWithRedirect(url, finalHeaders);
 
     // Detect playlist type
     const isMaster = text.includes('#EXT-X-STREAM-INF');
 
     if (isMaster) {
-        const variants = parseMasterPlaylist(text, url);
+        const variants = parseMasterPlaylist(text, finalUrl);
         // Also check for subtitles
         const subtitleMatches = [...text.matchAll(/#EXT-X-MEDIA:TYPE=SUBTITLES,[^\n]+LANGUAGE="([^"]+)"[^\n]+URI="([^"]+)"/g)];
         const subtitles = subtitleMatches.map(m => ({
             language: m[1],
-            url: resolveUrl(url, m[2]),
+            url: resolveUrl(finalUrl, m[2]),
         }));
 
         return {
@@ -161,19 +159,21 @@ async function parseHLS(url, headers = {}) {
             subtitles,
             isLive: false,
             raw: text,
+            finalUrl
         };
     } else {
-        const mediaInfo = parseMediaPlaylist(text, url);
+        const mediaInfo = parseMediaPlaylist(text, finalUrl);
         return {
             type: 'media',
             variants: [{
                 quality: 'Default',
                 height: 0,
                 bandwidth: 0,
-                url,
+                url: finalUrl,
                 segments: mediaInfo.segments,
             }],
             ...mediaInfo,
+            finalUrl
         };
     }
 }

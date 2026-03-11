@@ -281,7 +281,7 @@ export function Toolbar({ onAddDownload, onOpenAdvanced, onPauseAll, onResumeAll
             onChange={(e) => onSearchChange(e.target.value)}
           />
         </div>
-        <Button variant="ghost" size="icon" data-testid="button-settings">
+        <Button variant="ghost" size="icon" data-testid="button-settings" onClick={() => onOpenAdvanced()}>
           <Settings className="w-5 h-5" />
         </Button>
       </div>

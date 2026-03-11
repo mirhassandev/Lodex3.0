@@ -3,6 +3,8 @@ let overlayDiv = null;
 let activeVideo = null;
 let overlayDismissed = false;
 let trackingLoopId = null;
+let detectedMedia = []; // Store videos detected by background sniffer
+
 
 /**
  * 1. Global Link Interception (LodifyPro Style)
@@ -59,39 +61,58 @@ function showToast(message, type = 'success') {
 /**
  * 4. High-Performance Handshake (Direct Fetch)
  */
-function sendToNexus(url, filename, isYouTube = false) {
+function sendToNexus(url, filename, isYouTube = false, isStream = false) {
     const payload = {
         url,
         filename: filename || document.title,
         isYouTube: isYouTube || url.includes('youtube.com') || url.includes('youtu.be'),
+        isStream: isStream,
         userAgent: navigator.userAgent,
         referrer: window.location.href,
         isInteractive: true,
         source: 'browser-manual'
     };
 
-    fetch('http://127.0.0.1:4578/intercept', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    })
-    .then(r => r.json())
-    .then(data => { if (data.ok) showToast('Link Captured Successfully!'); })
-    .catch(() => {
-        chrome.runtime.sendMessage({ type: "DOWNLOAD_VIDEO", ...payload }, (res) => {
-            if (res && res.ok) showToast('Link Captured via Relay');
-        });
+    // Safety check for extension context invalidation
+    if (!chrome.runtime?.id) {
+        console.warn("[Nexus] Extension context invalidated. Please refresh the page.");
+        showToast("Extension updated. Please refresh!", "error");
+        return;
+    }
+
+    // ALWAYS relay through background to ensure cookies/auth headers are injected
+    chrome.runtime.sendMessage({ type: "DOWNLOAD_VIDEO", ...payload }, (res) => {
+        if (chrome.runtime.lastError) {
+            console.error("[Nexus] Relay error:", chrome.runtime.lastError.message);
+            showToast('Nexus App not responding', 'error');
+            return;
+        }
+        if (res && res.ok) {
+            showToast('Ready to Download!');
+        } else {
+            console.error("[Nexus] Relay failed:", res?.error);
+            showToast('Nexus App not responding', 'error');
+        }
     });
 }
+
 
 /**
  * 5. Persistent Overlay Logic (IDM Style)
  */
 function createOverlay() {
-    if (document.getElementById('nexus-video-overlay')) return;
+    // If in iframe, check if it's too small
+    if (window !== window.top) {
+        if (window.innerWidth < 200 || window.innerHeight < 200) {
+            console.log("[Nexus] Iframe too small, skipping overlay.");
+            return;
+        }
+    }
 
     overlayDiv = document.createElement('div');
     overlayDiv.id = 'nexus-video-overlay';
+    // Add a class if in iframe
+    if (window !== window.top) overlayDiv.classList.add('in-iframe');
 
     overlayDiv.innerHTML = `
         <div class="nexus-btn-container">
@@ -117,8 +138,48 @@ function createOverlay() {
 
     mainBtn.onclick = (e) => {
         e.stopPropagation();
-        sendToNexus(window.location.href, document.title, true);
+        
+        let urlToSend = window.location.href;
+        const hostname = window.location.hostname;
+
+        // If in Dailymotion player iframe, prefer referrer (the main video page)
+        if (window !== window.top && hostname === 'geo.dailymotion.com') {
+            if (document.referrer && document.referrer.includes('dailymotion.com')) {
+                console.log("[Nexus] Using referrer for iframe:", document.referrer);
+                urlToSend = document.referrer;
+            }
+        }
+
+        const isYtdlSite = hostname.includes('youtube.com') || 
+                           hostname.includes('facebook.com') || 
+                           hostname.includes('instagram.com') ||
+                           hostname.includes('dailymotion.com') ||
+                           hostname.includes('twitter.com') || 
+                           hostname.includes('x.com') ||
+                           hostname.includes('tiktok.com');
+        
+        // Dailymotion Specific: If we are on the player/embed (not the main video page)
+        // AND we have detected media streams (the manifest), use the manifest!
+        const isDailymotionPlayer = hostname.includes('geo.dailymotion.com') || urlToSend.includes('/embed/video/');
+
+        if (isDailymotionPlayer && detectedMedia.length > 0) {
+            const best = detectedMedia[0];
+            sendToNexus(best.url, document.title, false, best.isStream);
+        }
+        // Priority 1: If it's a known YTDL-capable site (and not the player iframe), prefer it
+        else if (isYtdlSite || urlToSend.includes('dailymotion.com/video/')) {
+            sendToNexus(urlToSend, document.title, true);
+        }
+        // Priority 2: If we have detected media streams (like chunks/m3u8 from unknown sites)
+        else if (detectedMedia.length > 0) {
+            const best = detectedMedia[0];
+            sendToNexus(best.url, document.title, false, best.isStream);
+        } else {
+            // Priority 3: Standard page extraction fallback
+            sendToNexus(urlToSend, document.title, false);
+        }
     };
+
 
     closeBtn.onclick = (e) => {
         e.stopPropagation();
@@ -214,14 +275,27 @@ document.addEventListener('fullscreenchange', () => {
     if (document.fullscreenElement) hideOverlay();
 });
 
-// Listen for navigation from background (SPA support)
+// Listen for navigation and media detection
 chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === "PAGE_NAVIGATED") {
-        overlayDismissed = false; // Reset for new video
+        overlayDismissed = false; 
         activeVideo = null;
+        detectedMedia = [];
         hideOverlay();
+    } else if (msg.type === "MEDIA_DETECTED") {
+        // Store detected media for the current page
+        detectedMedia.unshift(msg.media);
+        if (detectedMedia.length > 10) detectedMedia.pop();
+        console.log("[Nexus] Media detected in page:", msg.media.url);
+        
+        // Update overlay text if it's visible
+        if (overlayDiv && overlayDiv.classList.contains('visible')) {
+            const span = overlayDiv.querySelector('span');
+            if (span) span.innerText = `Download (${detectedMedia.length})`;
+        }
     }
 });
+
 
 // Initialization
 setupLinkInterception();

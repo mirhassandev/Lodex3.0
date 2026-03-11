@@ -79,12 +79,18 @@ class DownloadTask extends EventEmitter {
     this.emit('started', { id: this.id, size: this.size || 0 });
 
     try {
-      // Check for YouTube
-      if (this.url.includes('youtube.com') || this.url.includes('youtu.be') || this.protocol === 'ytdlp') {
-        console.log(`[DownloadTask] Routed to YouTube/yt-dlp handler: ${this.id}`);
+      // Routing Strategy: Route to advanced handlers (ytdlp/hls/dash)
+      const isYtdlDomain = this.url.includes('youtube.com') || this.url.includes('youtu.be') || 
+                           this.url.includes('facebook.com') || this.url.includes('instagram.com') ||
+                           this.url.includes('twitter.com') || this.url.includes('x.com') ||
+                           this.url.includes('tiktok.com') || this.url.includes('dailymotion.com');
+
+      if (isYtdlDomain || this.options.requiresYtdl || this.options.type === 'youtube' || this.protocol === 'ytdlp') {
+        console.log(`[DownloadTask] Routed to advanced (yt-dlp) handler: ${this.id}`);
         this._startSpeedTicker();
         return await this._startYouTubeDownload();
       }
+
 
       console.log(`[DownloadTask] Probing server: ${this.id}`);
 
@@ -226,20 +232,23 @@ class DownloadTask extends EventEmitter {
       });
 
       const args = [
-        this.url,
+        '--no-warnings',
+        '--no-check-certificate',
+        '--no-playlist',
         '--format', formatStr,
         '--ffmpeg-location', ffmpegPath,
         '--js-runtimes', 'node',
         ...extractionArgs,
         '--output', this.outPath,
         '--force-overwrites',
-        '--no-playlist',
         '--newline',
         '--continue',
         '--progress',
         '--progress-template', 'download:[NEXUS_PROGRESS] %(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s',
-        ...headerArgs
+        ...headerArgs,
+        this.url
       ].filter(arg => arg !== '');
+
 
       // Add merge-output-format only if not extracting audio
       if (extractionArgs.length === 0) {
@@ -248,7 +257,12 @@ class DownloadTask extends EventEmitter {
 
       // Add default headers if not provided
       if (!this.customHeaders['Referer'] && !this.customHeaders['referer']) {
-        args.push('--add-header', 'referer:youtube.com');
+        try {
+          const u = new URL(this.url);
+          args.push('--add-header', `referer:${u.protocol}//${u.host}/`);
+        } catch {
+          args.push('--add-header', 'referer:https://www.google.com/');
+        }
       }
 
       console.log('[Downloader] Spawning yt-dlp with args:', args.join(' '));
@@ -304,12 +318,13 @@ class DownloadTask extends EventEmitter {
 
       subprocess.stderr.on('data', (data) => {
         const errStr = data.toString();
-        this.lastStderr = errStr;
-        // Suppress JavaScript runtime noise
-        if (!errStr.includes('JavaScript runtime')) {
-          console.error('yt-dlp stderr:', errStr);
+        this.lastStderr = (this.lastStderr || '') + errStr;
+        // Suppress JavaScript runtime noise but log actual errors
+        if (!errStr.includes('JavaScript runtime') && !errStr.includes('Extracting')) {
+          console.error(`[yt-dlp-error] ${this.id}:`, errStr);
         }
       });
+
 
       subprocess.on('close', (code) => {
         if (code === 0) {
@@ -334,13 +349,22 @@ class DownloadTask extends EventEmitter {
 
   async _streamDownload() {
     try {
+      const finalHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        'Accept': 'application/octet-stream, */*',
+        ...this.customHeaders
+      };
+
+      if (!finalHeaders.Referer && !finalHeaders.referer) {
+        try {
+          const u = new URL(this.url);
+          finalHeaders.Referer = `${u.protocol}//${u.host}/`;
+        } catch {}
+      }
+
       const res = await requestWithRedirect(this.url, {
         method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/octet-stream, */*',
-          ...this.customHeaders
-        },
+        headers: finalHeaders,
         timeout: this.timeout
       });
 
@@ -454,12 +478,23 @@ class DownloadTask extends EventEmitter {
       range.inFlight = true;
 
       try {
+        const finalHeaders = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+          ...this.customHeaders
+        };
+
+        if (!finalHeaders.Referer && !finalHeaders.referer) {
+          try {
+            const u = new URL(this.url);
+            finalHeaders.Referer = `${u.protocol}//${u.host}/`;
+          } catch {}
+        }
+
         const res = await requestWithRedirect(this.url, {
           method: 'GET',
           headers: {
             'Range': `bytes=${range.start + range.downloaded}-${range.end}`,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            ...this.customHeaders
+            ...finalHeaders
           },
           timeout: 120000 // 2 minutes idle timeout instead of 15 seconds
         });
@@ -744,7 +779,10 @@ class DownloadManager extends EventEmitter {
     // Allow explicit override from caller (e.g. from IPC with pre-classified data)
     const protocol = options.protocol || (meta && meta.protocol) || 'direct';
     const isYtdl = options.type === 'youtube' || (meta && meta.requiresYtdl);
+    if (isYtdl) options.requiresYtdl = true; // Ensure flag is passed to task
+    
     const isStream = protocol === 'hls' || protocol === 'dash' || options.type === 'stream';
+
 
     let task;
     if (isStream) {
