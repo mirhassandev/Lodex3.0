@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   minimize: () => ipcRenderer.send('window/minimize'),
   close: () => ipcRenderer.send('window/close'),
   refreshSettings: () => ipcRenderer.invoke('settings/refresh'),
+  isDialogOpen: (id) => ipcRenderer.invoke('is-dialog-open', id),
   onDownloadDetected: (cb) => {
     ipcRenderer.on('download-detected', (_e, source, url, headers, meta) => cb(source, url, headers, meta));
     return () => ipcRenderer.removeAllListeners('download-detected');

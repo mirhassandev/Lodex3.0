@@ -123,7 +123,16 @@ class QueueManager extends EventEmitter {
 
     _attachTaskHandlers(task) {
         const onFinished = () => {
+            task.status = 'completed';
             this.active.delete(task.id);
+
+            // Broadcast the completed explicitly so the React UI transitions out of "downloading"
+            this.dm.emit('download', {
+                id: task.id,
+                event: 'finished',
+                payload: { status: 'completed', progress: 100 }
+            });
+
             console.log(`[Queue] Finished: ${task.id}. Slots free: ${this.maxConcurrent - this.active.size}`);
             this.processQueue();
             task.removeListener('finished', onFinished);

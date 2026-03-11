@@ -90,6 +90,48 @@ const PRESETS = {
     requiresYtdl: true,
     ext: '.mp3',
   },
+  pinterest: {
+    hosts: ['pinterest.com', 'pin.it'],
+    protocol: 'ytdl',
+    type: 'video',
+    requiresYtdl: true,
+    ext: '.mp4',
+  },
+  snapchat: {
+    hosts: ['snapchat.com'],
+    protocol: 'ytdl',
+    type: 'video',
+    requiresYtdl: true,
+    ext: '.mp4',
+  },
+  linkedin: {
+    hosts: ['linkedin.com'],
+    protocol: 'ytdl',
+    type: 'video',
+    requiresYtdl: true,
+    ext: '.mp4',
+  },
+  streamable: {
+    hosts: ['streamable.com'],
+    protocol: 'ytdl',
+    type: 'video',
+    requiresYtdl: true,
+    ext: '.mp4',
+  },
+  tumblr: {
+    hosts: ['tumblr.com'],
+    protocol: 'ytdl',
+    type: 'video',
+    requiresYtdl: true,
+    ext: '.mp4',
+  },
+  likee: {
+    hosts: ['likee.video', 'likee.com'],
+    protocol: 'ytdl',
+    type: 'video',
+    requiresYtdl: true,
+    ext: '.mp4',
+  },
 };
 
 /**

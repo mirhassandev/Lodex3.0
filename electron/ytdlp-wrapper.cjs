@@ -275,4 +275,4 @@ async function getMetadata(url, opts = {}) {
     };
 }
 
-module.exports = { getMetadata, parseFormats, formatDuration };
+module.exports = { getMetadata, parseFormats, formatDuration, getYtdlpPath };

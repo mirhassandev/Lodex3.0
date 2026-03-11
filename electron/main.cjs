@@ -9,7 +9,10 @@ try {
 }
 
 const electron = require('electron');
-const { app, BrowserWindow, ipcMain, shell } = electron;
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage } = electron;
+
+let appTray = null;
+let isQuitting = false;
 
 if (!app) {
   // Try to fallback to dummy app or log more info
@@ -249,9 +252,9 @@ dm.on('download', ({ id, event, payload }) => {
   } else if (event === 'finished') {
     // Ensure final size is saved if it was missed during progress
     const task = dm.tasks.get(id);
-    updateData = { 
-      status: 'completed', 
-      progress: 100, 
+    updateData = {
+      status: 'completed',
+      progress: 100,
       speed: 0,
       size: payload.size || (task ? task.size : 0)
     };
@@ -368,6 +371,14 @@ async function createWindow() {
     }
   }
 
+  mainWindow.on('close', (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      mainWindow.hide();
+      console.log('[Electron] Window hidden to tray');
+    }
+  });
+
   mainWindow.on('closed', () => {
     console.log('[Electron] Window closed');
     mainWindow = null;
@@ -381,6 +392,29 @@ app.on('ready', async () => {
   registerNativeHost();
 
   console.log('[Electron] App ready event fired');
+
+  // Build System Tray
+  const iconPath = path.join(__dirname, '..', 'client', 'public', 'favicon.png');
+  let trayIcon;
+  try {
+    trayIcon = nativeImage.createFromPath(iconPath);
+  } catch (e) { console.error('Tray icon missing'); }
+
+  appTray = new Tray(trayIcon || nativeImage.createEmpty());
+  appTray.setToolTip('Nexus Manager');
+  appTray.on('double-click', () => {
+    if (mainWindow) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+
+  const contextMenu = Menu.buildFromTemplate([
+    { label: 'Show Dashboard', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { isQuitting = true; app.quit(); } }
+  ]);
+  appTray.setContextMenu(contextMenu);
 
   if (process.env.NODE_ENV !== 'production') {
     console.log('[Electron] Starting dev server...');
@@ -411,10 +445,7 @@ app.on('ready', async () => {
 });
 
 app.on('window-all-closed', () => {
-  console.log('[Electron] All windows closed');
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  console.log('[Electron] All windows closed (Running in Background)');
 });
 
 app.on('before-quit', () => {
@@ -731,6 +762,11 @@ ipcMain.handle('download/start', async (_event, url, options = {}) => {
 
     try {
       console.log('[IPC] Download queued with ID:', task.id);
+
+      // Tag the requesting window with the active download ID if it's the dialog window
+      const senderWin = BrowserWindow.fromWebContents(_event.sender);
+      if (senderWin) senderWin.activeDownloadId = task.id;
+
       return { ok: true, id: task.id, outPath, filename, size: task.size || 0 };
     } catch (err) {
       console.error('[IPC] Failed to queue download:', err.message);
@@ -740,6 +776,20 @@ ipcMain.handle('download/start', async (_event, url, options = {}) => {
     console.error('[IPC] Download start error:', err);
     return { ok: false, message: err.message || 'Invalid URL' };
   }
+});
+
+// New IPC: Check if any open dialog window is actively showing this download
+ipcMain.handle('is-dialog-open', (_event, downloadId) => {
+  const windows = BrowserWindow.getAllWindows();
+  for (const win of windows) {
+    if (!win.isDestroyed() && win.activeDownloadId === downloadId) {
+      // Must also be physically visible
+      if (win.isVisible()) {
+        return true;
+      }
+    }
+  }
+  return false;
 });
 
 ipcMain.handle('download/pause', (_event, id) => {

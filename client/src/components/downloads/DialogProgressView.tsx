@@ -1,172 +1,149 @@
 import React from "react";
 import { DownloadItem } from "@/lib/mock-data";
-import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
-import { 
-    X, Pause, Play, FolderOpen, 
-    MonitorPlay, Zap, Clock, Info, CheckCircle2, RotateCw 
-} from "lucide-react";
-import { motion } from "framer-motion";
-import { formatBytes } from "@/lib/formatters";
+import { formatBytes, formatSpeed, formatEta } from "@/lib/formatters";
+import { Minus, X } from "lucide-react";
 
 interface DialogProgressViewProps {
-  download: DownloadItem;
-  onClose: () => void;
-  onPause: () => void;
-  onResume: () => void;
-  onCancel: () => void;
+    download: DownloadItem;
+    onClose: () => void;
+    onPause: () => void;
+    onResume: () => void;
+    onCancel: () => void;
 }
 
 export function DialogProgressView({ download, onClose, onPause, onResume, onCancel }: DialogProgressViewProps) {
-  const electronAPI = (window as any).electronAPI;
+    const electronAPI = (window as any).electronAPI;
 
-  const handleOpenFolder = () => {
-    if (download.outPath && electronAPI?.openFolder) {
-      electronAPI.openFolder(download.outPath);
-      onClose();
-    }
-  };
+    const handleOpenFolder = () => {
+        if (download.outPath && electronAPI?.openFolder) {
+            electronAPI.openFolder(download.outPath);
+            onClose();
+        }
+    };
 
-  const handleOpenFile = () => {
-    if (download.outPath && electronAPI?.openFile) {
-      electronAPI.openFile(download.outPath);
-      onClose();
-    }
-  };
+    const handleOpenFile = () => {
+        if (download.outPath && electronAPI?.openFile) {
+            electronAPI.openFile(download.outPath);
+            onClose();
+        }
+    };
 
-  const isComplete = download.status === "completed";
-  const isFailed = download.status === "error";
-  const isPaused = download.status === "paused";
+    const handleMinimize = () => {
+        if (electronAPI?.minimize) {
+            electronAPI.minimize();
+        }
+    };
 
-  return (
-    <motion.div
-        initial={{ opacity: 0, scale: 0.95, y: 20 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        className="bg-[#0b0f1a] w-full h-full rounded-2xl overflow-hidden border border-white/10 shadow-[0_25px_50px_-12px_rgba(0,0,0,0.7)] flex flex-col"
-    >
-        {/* ── Header ────────────────────────────────────────────────────────── */}
-        <div 
-            style={{ WebkitAppRegion: 'drag' } as any}
-            className="h-10 flex items-center px-4 relative shrink-0 border-b border-white/5 bg-[#0d1321]"
-        >
-            {/* macOS Window Controls */}
-            <div className="flex gap-2 mr-6" style={{ WebkitAppRegion: 'no-drag' } as any}>
-                <button onClick={onClose} className="w-2.5 h-2.5 rounded-full bg-[#ff5f57] hover:brightness-110 transition-all shadow-lg border border-black/10" />
-                <button onClick={() => electronAPI?.minimize?.()} className="w-2.5 h-2.5 rounded-full bg-[#febc2e] hover:brightness-110 transition-all shadow-lg border border-black/10" />
-                <button className="w-2.5 h-2.5 rounded-full bg-[#28c840] hover:brightness-110 transition-all shadow-lg border border-black/10 opacity-30 cursor-not-allowed" />
-            </div>
-            
-            <div className="flex items-center gap-2">
-                <MonitorPlay className="w-3.5 h-3.5 text-blue-400" />
-                <span className="text-[10px] font-black tracking-widest text-white/40 uppercase">Download Progress</span>
-            </div>
-        </div>
+    const isComplete = download.status === "completed";
+    const isFailed = download.status === "error";
+    const isPaused = download.status === "paused";
 
-        {/* ── Main Content ────────────────────────────────────────── */}
-        <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
-            {/* File Identity */}
-            <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3 relative overflow-hidden group shadow-lg">
-                <div className="flex gap-3 relative z-10">
-                    <div className="w-14 h-14 bg-black/40 rounded border border-white/5 flex items-center justify-center flex-shrink-0 group-hover:scale-105 transition-transform duration-500 shadow-inner">
-                        <MonitorPlay className="w-6 h-6 text-blue-500" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                        <h3 className="text-white font-black text-sm leading-tight truncate mb-1">{download.name}</h3>
-                        <div className="flex flex-wrap gap-2 text-[9px] text-white/40 font-bold uppercase tracking-tight">
-                            <span className="flex items-center gap-1">
-                                <Info className="w-2.5 h-2.5 text-blue-400" /> 
-                                {download.totalBytes ? formatBytes(download.totalBytes) : download.size || "Calculating..."}
-                            </span>
-                            <span className="flex items-center gap-1">
-                                <Clock className="w-2.5 h-2.5 text-blue-400" /> 
-                                {download.status === 'queued' ? 'In Queue' : download.status}
-                            </span>
-                        </div>
-                    </div>
+    // Real-time values mapped from download state
+    const progressText = download.progress ? download.progress.toFixed(2) : "0.00";
+
+    // Normalize speed format using formatters if backend sends raw number
+    let speedText = download.speed || "Calculating...";
+    if (typeof download.speed === 'number') speedText = formatSpeed(download.speed);
+
+    // Normalize ETA
+    let timeLeftText = download.eta || "Calculating...";
+    if (typeof download.eta === 'number') timeLeftText = formatEta(download.eta);
+
+    const downloadedText = download.downloadedBytes ? formatBytes(download.downloadedBytes) : "0 B";
+    const fileSizeText = download.totalBytes ? formatBytes(download.totalBytes) : (download.size || "Unknown");
+
+    let statusText = "Receiving data...";
+    if (isComplete) statusText = "Finished";
+    else if (isPaused) statusText = "Paused";
+    else if (isFailed) statusText = "Error";
+    else if (download.status === 'queued') statusText = "In Queue";
+
+    return (
+        <div className="idm-dialog h-full w-full max-w-[500px] max-h-[400px] absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
+            <div
+                style={{ WebkitAppRegion: 'drag' } as any}
+                className="flex items-center justify-between mb-4 pb-2 border-b border-border cursor-move"
+            >
+                <div className="flex items-center gap-2">
+                    <img src="./icon.png" className="w-4 h-4 opacity-80" alt="" onError={(e) => e.currentTarget.style.display = 'none'} />
+                    <h3 className="m-0 text-[14px] font-medium text-foreground p-0 border-none" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                        Download Progress
+                    </h3>
+                </div>
+
+                <div className="flex items-center gap-2 ml-auto" style={{ WebkitAppRegion: 'no-drag' } as any}>
+                    <button
+                        onClick={handleMinimize}
+                        className="w-3 h-3 rounded-full bg-[#febc2e] hover:bg-[#febc2ecc] border border-[#d8a120] transition-colors"
+                        title="Minimize"
+                    />
+                    <button
+                        onClick={onClose}
+                        className="w-3 h-3 rounded-full bg-[#ff5f57] hover:bg-[#ff5f57cc] border border-[#e0443e] transition-colors"
+                        title="Close"
+                    />
                 </div>
             </div>
 
-            {/* Progress Visual */}
-            <div className="space-y-2">
-                <div className="flex justify-between items-end">
-                    <span className="text-[9px] font-black uppercase tracking-widest text-blue-400/80">Transfer Progress</span>
-                    <span className="text-lg font-black text-white tabular-nums tracking-tighter">
-                        {Math.floor(download.progress || 0)}<span className="text-[10px] text-white/40 ml-0.5">%</span>
-                    </span>
-                </div>
-                <div className="h-1.5 bg-black/40 rounded-full border border-white/5 p-0.5 relative shadow-inner overflow-hidden">
-                    <Progress value={download.progress} className="h-full bg-blue-500 transition-all duration-300 shadow-[0_0_10px_rgba(59,130,246,0.3)]" />
-                </div>
+            <div className="text-[13px] font-semibold text-foreground mb-4 truncate drop-shadow-sm" title={download.name}>
+                {download.name}
             </div>
 
-            {/* Stats Grid */}
-            <div className="grid grid-cols-2 gap-2">
-                {[
-                    { label: "Transfer Rate", value: download.speed, icon: Zap },
-                    { label: "Remaining", value: download.eta, icon: Clock },
-                    { label: "Downloaded", value: download.downloadedBytes ? formatBytes(download.downloadedBytes) : "0 B", icon: MonitorPlay },
-                    { label: "Nodes", value: download.connections || 8, icon: Info },
-                ].map((stat, i) => (
-                    <div key={i} className="bg-white/[0.02] border border-white/5 p-2 rounded-lg group hover:border-blue-500/10 transition-all">
-                        <p className="text-[8px] font-black text-white/20 uppercase tracking-[0.2em] mb-1 flex items-center gap-1.5">
-                            <stat.icon className="w-2 h-2" /> {stat.label}
-                        </p>
-                        <p className="text-white font-bold text-xs tabular-nums truncate">{stat.value}</p>
+            <div className="download-info">
+                <p><b>Status:</b></p><p>{statusText}</p>
+                <p><b>File size:</b></p><p>{fileSizeText}</p>
+                <p><b>Downloaded:</b></p><p className="text-primary font-medium">{downloadedText} ({progressText}%)</p>
+                <p><b>Transfer rate:</b></p><p>{speedText}</p>
+                <p><b>Time left:</b></p><p>{timeLeftText}</p>
+                <p><b>Resume capability:</b></p><p>Yes</p>
+            </div>
+
+            <div className="progress-container">
+                <div className="progress-bar" style={{ width: `${download.progress || 0}%` }} />
+            </div>
+
+            <SegmentBars connCount={download.connections || 8} progress={download.progress || 0} isComplete={isComplete} />
+
+            <div className="controls mt-5">
+                {isComplete ? (
+                    <>
+                        <button onClick={handleOpenFile}>Open</button>
+                        <button onClick={handleOpenFolder}>Open Folder</button>
+                        <button onClick={onClose} className="!border-primary/50 hover:!bg-primary/20">Close</button>
+                    </>
+                ) : (
+                    <>
+                        {isPaused ? (
+                            <button onClick={onResume}>Resume</button>
+                        ) : (
+                            <button onClick={onPause}>Pause</button>
+                        )}
+                        <button onClick={onClose} title="Hide the dialog but continue downloading">Hide</button>
+                        <button onClick={onCancel} className="hover:!border-destructive !text-destructive/80 hover:!text-destructive hover:!bg-destructive/10">Cancel</button>
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function SegmentBars({ connCount, progress, isComplete }: { connCount: number, progress: number, isComplete: boolean }) {
+    const segments = new Array(Math.max(1, connCount)).fill(0);
+
+    return (
+        <div className="segments">
+            {segments.map((_, i) => {
+                const segmentProgress = isComplete ? 100 : Math.min(100, Math.max(0, (progress - (i * (100 / segments.length))) * segments.length));
+
+                return (
+                    <div key={i} className="segment">
+                        <div
+                            className="segment-fill"
+                            style={{ width: `${segmentProgress}%` }}
+                        />
                     </div>
-                ))}
-            </div>
+                );
+            })}
         </div>
-
-        {/* ── Action Footer ─────────────────────────────────────────────────── */}
-        <div className="p-4 bg-[#0f172a] border-t border-white/5 flex gap-3 shrink-0 shadow-[0_-10px_30px_rgba(0,0,0,0.5)]">
-            {isComplete ? (
-                <>
-                    <Button 
-                        className="flex-1 bg-blue-600 hover:bg-blue-500 text-white font-bold h-9 rounded-lg gap-2 shadow-lg transition-all active:scale-[0.98] text-[11px]"
-                        onClick={handleOpenFile}
-                    >
-                        <Zap className="w-3.5 h-3.5 fill-white/10" />
-                        OPEN FILE
-                    </Button>
-                    <Button 
-                        variant="secondary"
-                        className="flex-1 bg-white/[0.03] hover:bg-white/[0.06] text-white/60 hover:text-white font-bold h-9 rounded-lg gap-2 border border-white/5 transition-all active:scale-[0.98] text-[11px]"
-                        onClick={handleOpenFolder}
-                    >
-                        <FolderOpen className="w-3.5 h-3.5 text-blue-400" />
-                        FOLDER
-                    </Button>
-                </>
-            ) : (
-                <>
-                    {isPaused ? (
-                        <Button 
-                            className="flex-1 bg-green-600 hover:bg-green-500 text-white font-bold h-9 rounded-lg gap-2 shadow-lg transition-all active:scale-[0.98] text-[11px]"
-                            onClick={onResume}
-                        >
-                            <Play className="w-3.5 h-3.5 fill-white/10" />
-                            RESUME
-                        </Button>
-                    ) : (
-                        <Button 
-                            className="flex-1 bg-white/10 hover:bg-white/15 text-white font-bold h-9 rounded-lg gap-2 shadow-lg transition-all active:scale-[0.98] text-[11px]"
-                            onClick={onPause}
-                        >
-                            <Pause className="w-3.5 h-3.5 fill-white/10" />
-                            PAUSE
-                        </Button>
-                    )}
-                    <Button 
-                        variant="destructive"
-                        className="flex-1 bg-red-600/10 hover:bg-red-600/20 text-red-500 font-bold h-9 rounded-lg gap-2 border border-red-500/20 transition-all active:scale-[0.98] text-[11px]"
-                        onClick={onCancel}
-                    >
-                        <X className="w-3.5 h-3.5" />
-                        CANCEL
-                    </Button>
-                </>
-            )}
-        </div>
-    </motion.div>
-  );
+    );
 }

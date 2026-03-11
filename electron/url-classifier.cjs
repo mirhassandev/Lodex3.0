@@ -26,10 +26,22 @@ const EXT_MAP = {
     '.mov': { type: 'video', mime: 'video/quicktime', protocol: 'direct' },
     '.flv': { type: 'video', mime: 'video/x-flv', protocol: 'direct' },
     '.wmv': { type: 'video', mime: 'video/x-ms-wmv', protocol: 'direct' },
+    '.3gp': { type: 'video', mime: 'video/3gpp', protocol: 'direct' },
+    '.asf': { type: 'video', mime: 'video/x-ms-asf', protocol: 'direct' },
+    '.m4v': { type: 'video', mime: 'video/x-m4v', protocol: 'direct' },
+    '.mpe': { type: 'video', mime: 'video/mpeg', protocol: 'direct' },
+    '.mpeg': { type: 'video', mime: 'video/mpeg', protocol: 'direct' },
+    '.mpg': { type: 'video', mime: 'video/mpeg', protocol: 'direct' },
+    '.ogv': { type: 'video', mime: 'video/ogg', protocol: 'direct' },
+    '.qt': { type: 'video', mime: 'video/quicktime', protocol: 'direct' },
+    '.rm': { type: 'video', mime: 'application/vnd.rn-realmedia', protocol: 'direct' },
+    '.rmvb': { type: 'video', mime: 'application/vnd.rn-realmedia-vbr', protocol: 'direct' },
+
     // Streams
     '.m3u8': { type: 'stream', mime: 'application/x-mpegURL', protocol: 'hls', isStream: true },
     '.mpd': { type: 'stream', mime: 'application/dash+xml', protocol: 'dash', isStream: true },
     '.ts': { type: 'stream', mime: 'video/mp2t', protocol: 'direct' },
+
     // Audio
     '.mp3': { type: 'audio', mime: 'audio/mpeg', protocol: 'direct' },
     '.m4a': { type: 'audio', mime: 'audio/mp4', protocol: 'direct' },
@@ -37,6 +49,11 @@ const EXT_MAP = {
     '.wav': { type: 'audio', mime: 'audio/wav', protocol: 'direct' },
     '.ogg': { type: 'audio', mime: 'audio/ogg', protocol: 'direct' },
     '.aac': { type: 'audio', mime: 'audio/aac', protocol: 'direct' },
+    '.aif': { type: 'audio', mime: 'audio/x-aiff', protocol: 'direct' },
+    '.mpa': { type: 'audio', mime: 'audio/mpeg', protocol: 'direct' },
+    '.ra': { type: 'audio', mime: 'audio/x-pn-realaudio', protocol: 'direct' },
+    '.wma': { type: 'audio', mime: 'audio/x-ms-wma', protocol: 'direct' },
+
     // Documents
     '.pdf': { type: 'document', mime: 'application/pdf', protocol: 'direct' },
     '.doc': { type: 'document', mime: 'application/msword', protocol: 'direct' },
@@ -44,7 +61,9 @@ const EXT_MAP = {
     '.xls': { type: 'document', mime: 'application/vnd.ms-excel', protocol: 'direct' },
     '.xlsx': { type: 'document', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', protocol: 'direct' },
     '.ppt': { type: 'document', mime: 'application/vnd.ms-powerpoint', protocol: 'direct' },
+    '.pps': { type: 'document', mime: 'application/vnd.ms-powerpoint', protocol: 'direct' },
     '.txt': { type: 'document', mime: 'text/plain', protocol: 'direct' },
+
     // Images
     '.jpg': { type: 'image', mime: 'image/jpeg', protocol: 'direct' },
     '.jpeg': { type: 'image', mime: 'image/jpeg', protocol: 'direct' },
@@ -52,19 +71,40 @@ const EXT_MAP = {
     '.gif': { type: 'image', mime: 'image/gif', protocol: 'direct' },
     '.webp': { type: 'image', mime: 'image/webp', protocol: 'direct' },
     '.svg': { type: 'image', mime: 'image/svg+xml', protocol: 'direct' },
+    '.tif': { type: 'image', mime: 'image/tiff', protocol: 'direct' },
+    '.tiff': { type: 'image', mime: 'image/tiff', protocol: 'direct' },
+
     // Archives
     '.zip': { type: 'archive', mime: 'application/zip', protocol: 'direct' },
     '.rar': { type: 'archive', mime: 'application/x-rar-compressed', protocol: 'direct' },
     '.7z': { type: 'archive', mime: 'application/x-7z-compressed', protocol: 'direct' },
     '.tar': { type: 'archive', mime: 'application/x-tar', protocol: 'direct' },
     '.gz': { type: 'archive', mime: 'application/gzip', protocol: 'direct' },
-    // Software
+    '.gzip': { type: 'archive', mime: 'application/gzip', protocol: 'direct' },
+    '.ace': { type: 'archive', mime: 'application/x-ace-compressed', protocol: 'direct' },
+    '.arj': { type: 'archive', mime: 'application/x-arj', protocol: 'direct' },
+    '.bz2': { type: 'archive', mime: 'application/x-bzip2', protocol: 'direct' },
+    '.lzh': { type: 'archive', mime: 'application/x-lzh', protocol: 'direct' },
+    '.r00': { type: 'archive', mime: 'application/x-rar-compressed', protocol: 'direct' },
+    '.r01': { type: 'archive', mime: 'application/x-rar-compressed', protocol: 'direct' },
+    '.r02': { type: 'archive', mime: 'application/x-rar-compressed', protocol: 'direct' },
+    '.r10': { type: 'archive', mime: 'application/x-rar-compressed', protocol: 'direct' },
+    '.sea': { type: 'archive', mime: 'application/x-sea', protocol: 'direct' },
+    '.sit': { type: 'archive', mime: 'application/x-stuffit', protocol: 'direct' },
+    '.sitx': { type: 'archive', mime: 'application/x-stuffitx', protocol: 'direct' },
+    '.z': { type: 'archive', mime: 'application/x-compress', protocol: 'direct' },
+
+    // Software & Disk Images
     '.exe': { type: 'program', mime: 'application/x-msdownload', protocol: 'direct' },
     '.dmg': { type: 'program', mime: 'application/x-apple-diskimage', protocol: 'direct' },
     '.apk': { type: 'program', mime: 'application/vnd.android.package-archive', protocol: 'direct' },
     '.iso': { type: 'program', mime: 'application/x-iso9660-image', protocol: 'direct' },
+    '.img': { type: 'program', mime: 'application/x-img', protocol: 'direct' },
     '.deb': { type: 'program', mime: 'application/x-debian-package', protocol: 'direct' },
     '.msi': { type: 'program', mime: 'application/x-msi', protocol: 'direct' },
+    '.msu': { type: 'program', mime: 'application/vnd.ms-cab-compressed', protocol: 'direct' },
+    '.bin': { type: 'program', mime: 'application/octet-stream', protocol: 'direct' },
+    '.plj': { type: 'program', mime: 'application/octet-stream', protocol: 'direct' },
 };
 
 // ─── MIME → type/ext fallback map ─────────────────────────────────────────────

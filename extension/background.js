@@ -10,8 +10,13 @@ chrome.runtime.onInstalled.addListener(() => {
 
 // 1. Download Intercept Filter
 const INTERCEPT_EXTENSIONS = [
-    ".exe", ".msi", ".zip", ".rar", ".7z",
-    ".iso", ".tar", ".dmg", ".bin", ".mkv", ".mp4"
+    // Original core
+    ".exe", ".msi", ".zip", ".rar", ".7z", ".iso", ".tar", ".dmg", ".bin", ".mkv", ".mp4",
+    // Expanded User Requests
+    ".3gp", ".aac", ".ace", ".aif", ".apk", ".arj", ".asf", ".avi", ".bz2", ".gz", ".gzip",
+    ".img", ".lzh", ".m4a", ".m4v", ".mov", ".mp3", ".mpa", ".mpe", ".mpeg", ".mpg", ".msu",
+    ".ogg", ".ogv", ".pdf", ".plj", ".pps", ".ppt", ".qt", ".r00", ".r01", ".r02", ".r10",
+    ".ra", ".rm", ".rmvb", ".sea", ".sit", ".sitx", ".tif", ".tiff", ".wav", ".wma", ".wmv", ".z"
 ];
 
 // 2. Main Interceptor
@@ -172,17 +177,17 @@ chrome.webRequest.onHeadersReceived.addListener(
         if (isMedia && details.responseHeaders) {
             const ct = details.responseHeaders.find(h => h.name.toLowerCase() === 'content-type');
             const cl = details.responseHeaders.find(h => h.name.toLowerCase() === 'content-length');
-            
+
             const contentType = ct ? ct.value.toLowerCase() : '';
             mimeType = contentType;
             const contentLength = cl ? parseInt(cl.value) : 0;
 
             // Only allow if it's a manifest (small) or a real media file (> 2MB)
-            const isManifest = STREAM_EXTENSIONS.some(ext => lcUrl.split('?')[0].endsWith(ext)) || 
-                               contentType.includes('mpegurl') || contentType.includes('dash+xml');
-            
+            const isManifest = STREAM_EXTENSIONS.some(ext => lcUrl.split('?')[0].endsWith(ext)) ||
+                contentType.includes('mpegurl') || contentType.includes('dash+xml');
+
             if (!isManifest && contentLength > 0 && contentLength < 2 * 1024 * 1024) {
-               isMedia = false;
+                isMedia = false;
             }
 
             if (isMedia && !isManifest && !contentType.includes('video') && !contentType.includes('audio') && !lcUrl.includes('mpeg')) {
@@ -269,9 +274,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo.url) {
         // Normal navigation OR SPA history change (YouTube/Twitter)
         console.log(`[Nexus] Navigated to ${changeInfo.url}, clearing tab ${tabId} streams`);
-        
+
         detectedInTab.delete(tabId);
-        
+
         // Clear local storage streams for this tab or entirely if desired
         chrome.storage.local.get("streams", ({ streams }) => {
             if (streams) {
@@ -281,7 +286,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         });
 
         // Notify content script to reset UI
-        chrome.tabs.sendMessage(tabId, { type: "PAGE_NAVIGATED", url: changeInfo.url }).catch(() => {});
+        chrome.tabs.sendMessage(tabId, { type: "PAGE_NAVIGATED", url: changeInfo.url }).catch(() => { });
     }
 });
 

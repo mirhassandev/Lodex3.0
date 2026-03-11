@@ -144,12 +144,12 @@ function App() {
           };
           setDownloads(prev => [itemWithId, ...prev]);
           const isScheduled = youtubeOptions?.status === 'scheduled';
-          toast({ 
-            title: isScheduled ? "Download Scheduled" : "Download Started", 
-            description: isScheduled 
-              ? `Scheduled: ${itemWithId.name}` 
-              : `Started downloading ${itemWithId.name}` 
-          });
+          if (isScheduled) {
+            toast({
+              title: "Download Scheduled",
+              description: `Scheduled: ${itemWithId.name}`
+            });
+          }
 
           // Only switch to progress view for immediate (non-scheduled) downloads
           if (window.location.search.includes("dialog=true") && !isScheduled) {
@@ -184,10 +184,6 @@ function App() {
       priority: "normal"
     };
     setDownloads(prev => [newDownload, ...prev]);
-    toast({
-      title: "Download Started",
-      description: `Started downloading ${name}`,
-    });
   }, [toast, pendingDownload]);
 
   // Wire electron download events (progress/finished/error/clipboard)
@@ -204,12 +200,6 @@ function App() {
 
         // IDM Powerhouse: Open the dedicated dialog instead of just a toast
         setPendingDownload({ url, headers, meta });
-
-        toast({
-          title: isBrowser ? "Stream Detected 🚀" : "Link Detected 📋",
-          description: "New download information received. Opening dialog...",
-          duration: 3000
-        });
       });
     }
 
@@ -219,7 +209,7 @@ function App() {
       setDownloads(prev => {
         // Prevent duplicates if handleAddDownload already added it
         if (prev.find(d => d.id === data.id)) return prev;
-        
+
         const isScheduled = data.status === 'scheduled';
         const newItem: DownloadItem = {
           id: data.id,
@@ -262,17 +252,28 @@ function App() {
       } : d));
     });
 
-    const unsubFinished = electronAPI.onDownloadEvent('finished', (data: any) => {
-      setDownloads(prev => prev.map(d => d.id === data.id ? { 
-        ...d, 
-        status: 'completed', 
-        progress: 100, 
-        speed: '0 KB/s', 
+    const unsubFinished = electronAPI.onDownloadEvent('finished', async (data: any) => {
+      setDownloads(prev => prev.map(d => d.id === data.id ? {
+        ...d,
+        status: 'completed',
+        progress: 100,
+        speed: '0 KB/s',
         eta: 'Finished',
         totalBytes: data.size || d.totalBytes,
         size: (data.size || d.totalBytes) ? formatBytes(data.size || d.totalBytes) : d.size
       } : d));
-      toast({ title: 'Download Finished', description: `Download completed` });
+
+      const params = new URLSearchParams(window.location.search);
+      const isCurrentlyDialog = params.get("dialog") === "true";
+
+      if (!isCurrentlyDialog) {
+        // Query the main engine to see if the user is currently staring at a popup dialog for this exact file
+        const isPopupActive = await electronAPI.isDialogOpen(data.id);
+        if (!isPopupActive) {
+          toast({ title: 'Download Finished', description: `Download completed` });
+        }
+      }
+
       delete speedTrackingRef.current[data.id];
     });
 
@@ -283,12 +284,12 @@ function App() {
     });
 
     const unsubStarted = electronAPI.onDownloadEvent('started', (data: any) => {
-      setDownloads(prev => prev.map(d => d.id === data.id ? { 
-        ...d, 
-        totalBytes: data.size || d.totalBytes, 
+      setDownloads(prev => prev.map(d => d.id === data.id ? {
+        ...d,
+        totalBytes: data.size || d.totalBytes,
         size: (data.size || d.totalBytes) ? formatBytes(data.size || d.totalBytes) : d.size,
-        status: 'downloading', 
-        speed: 'Starting...' 
+        status: 'downloading',
+        speed: 'Starting...'
       } : d));
     });
 
@@ -349,8 +350,8 @@ function App() {
   }, [isDialogMode]);
 
   if (isDialogMode) {
-    const activeDl = activeDialogDownloadId 
-      ? downloads.find(d => d.id === activeDialogDownloadId) 
+    const activeDl = activeDialogDownloadId
+      ? downloads.find(d => d.id === activeDialogDownloadId)
       : null;
 
     if (activeDl) {

@@ -12,6 +12,7 @@ const { classify } = require('./url-classifier.cjs');
 const { SegmentedDownloader } = require('./segmented-downloader.cjs');
 const { QueueManager } = require('./queue-manager.cjs');
 const { requestWithRedirect, headWithRedirect } = require('./request-utils.cjs');
+const { getYtdlpPath } = require('./ytdlp-wrapper.cjs');
 
 class DownloadTask extends EventEmitter {
   constructor(id, url, outPath, options = {}) {
@@ -68,7 +69,8 @@ class DownloadTask extends EventEmitter {
   }
 
   async start() {
-    if (this.status === 'downloading') return;
+    // Note: QueueManager might set status to 'downloading' BEFORE calling start()
+    // so we shouldn't bail out here if already 'downloading'.
 
     this.status = 'downloading';
     console.log(`[DownloadTask] Starting task: ${this.id} (${this.url.substring(0, 50)}...)`);
@@ -95,7 +97,7 @@ class DownloadTask extends EventEmitter {
       }, 30000);
 
       const head = await this.headRequest();
-      
+
       if (head.finalUrl && head.finalUrl !== this.url) {
         console.log(`[DownloadTask] Redirect detected: ${this.url} -> ${head.finalUrl}`);
         this.url = head.finalUrl;
@@ -177,9 +179,16 @@ class DownloadTask extends EventEmitter {
 
       const { spawn } = require('child_process');
       const path = require('path');
-      const ytpPath = path.join(__dirname, '..', 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp.exe');
+      const ytpPath = getYtdlpPath();
       const os = require('os');
       const fs = require('fs');
+
+      // Ensure directory exists
+      const dir = path.dirname(this.outPath);
+      if (!fs.existsSync(dir)) {
+        console.log(`[Downloader] Creating directory: ${dir}`);
+        fs.mkdirSync(dir, { recursive: true });
+      }
 
       // Workaround: Copy ffmpeg to temp dir to avoid spaces in path which yt-dlp hates
       const sourceFfmpeg = require('ffmpeg-static');
@@ -220,17 +229,22 @@ class DownloadTask extends EventEmitter {
         this.url,
         '--format', formatStr,
         '--ffmpeg-location', ffmpegPath,
+        '--js-runtimes', 'node',
         ...extractionArgs,
-        '--merge-output-format', extractionArgs.length > 0 ? '' : 'mp4',
         '--output', this.outPath,
         '--force-overwrites',
         '--no-playlist',
         '--newline',
-        '--continue', // Add --continue for resuming
-        '--progress', // Enable progress output
-        '--progress-template', 'download:[%(progress.downloaded_bytes)s/%(progress.total_bytes)s] speed:[%(progress.speed)s] eta:[%(progress.eta)s]', // Custom progress template
+        '--continue',
+        '--progress',
+        '--progress-template', 'download:[NEXUS_PROGRESS] %(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s',
         ...headerArgs
-      ];
+      ].filter(arg => arg !== '');
+
+      // Add merge-output-format only if not extracting audio
+      if (extractionArgs.length === 0) {
+        args.push('--merge-output-format', 'mp4');
+      }
 
       // Add default headers if not provided
       if (!this.customHeaders['Referer'] && !this.customHeaders['referer']) {
@@ -246,72 +260,61 @@ class DownloadTask extends EventEmitter {
       });
 
       subprocess.stdout.on('data', (data) => {
-        const line = data.toString();
-        // Parse progress from yt-dlp output 
-        if (line.includes('[download]')) {
-          const percentMatch = line.match(/(\d+(\.\d+)?)%/);
-          const sizeMatch = line.match(/of\s+~?(\d+(\.\d+)?)([KMG]i?B)/);
+        const lines = data.toString().trim().split('\n');
 
-          if (percentMatch) {
-            const percent = parseFloat(percentMatch[1]);
-            if (sizeMatch && !this.size) {
-              const val = parseFloat(sizeMatch[1]);
-              const unit = sizeMatch[3];
-              let bytes = val;
-              if (unit.includes('K')) bytes *= 1024;
-              if (unit.includes('M')) bytes *= 1024 * 1024;
-              if (unit.includes('G')) bytes *= 1024 * 1024 * 1024;
-              this.size = Math.floor(bytes);
-            }
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line) continue;
 
-            if (this.size) {
-              this.downloaded = Math.floor((percent / 100) * this.size);
-              this.emit('progress', { id: this.id, downloaded: this.downloaded, total: this.size, outPath: this.outPath });
-            }
-          } else if (line.startsWith('download:')) { // Parse custom progress template
-            const downloadedMatch = line.match(/download:\[(\d+(\.\d+)?)([KMG]i?B)\/(\d+(\.\d+)?)([KMG]i?B)\]/);
-            const speedMatch = line.match(/speed:\[(\d+(\.\d+)?)([KMG]i?B\/s)\]/);
-            const etaMatch = line.match(/eta:\[(\d+:\d+:\d+)\]/);
+          if (!line.includes('[NEXUS_PROGRESS]')) {
+            console.log(`[yt-dlp] ${line}`);
+            continue;
+          }
 
-            if (downloadedMatch) {
-              const parseBytes = (val, unit) => {
-                let bytes = parseFloat(val);
-                if (unit.includes('K')) bytes *= 1024;
-                if (unit.includes('M')) bytes *= 1024 * 1024;
-                if (unit.includes('G')) bytes *= 1024 * 1024 * 1024;
-                return Math.floor(bytes);
-              };
+          // New format: download:[NEXUS_PROGRESS] 12345|67890|456|12
+          // It's possible for values to be 'NA' or missing initially
+          try {
+            const parts = line.split('[NEXUS_PROGRESS] ')[1];
+            if (!parts) continue;
 
-              const downloadedBytes = parseBytes(downloadedMatch[1], downloadedMatch[3]);
-              const totalBytes = parseBytes(downloadedMatch[4], downloadedMatch[6]);
-              const speedStr = speedMatch ? speedMatch[1] + speedMatch[3] : '0B/s';
-              const etaStr = etaMatch ? etaMatch[1] : '00:00:00';
+            const [dlStr, totalStr, speedStr, etaStr] = parts.split('|');
 
-              this.downloaded = downloadedBytes;
-              this.size = totalBytes;
+            let downloadedNow = dlStr !== 'NA' ? parseInt(dlStr, 10) : 0;
+            let totalNow = totalStr !== 'NA' ? parseInt(totalStr, 10) : this.size || 0;
+            let speedRaw = speedStr !== 'NA' ? parseFloat(speedStr) : 0;
+            let etaRaw = etaStr !== 'NA' ? parseInt(etaStr, 10) : -1;
 
-              this.emit('progress', {
-                id: this.id,
-                downloaded: downloadedBytes,
-                total: totalBytes,
-                speed: speedStr,
-                eta: etaStr,
-                outPath: this.outPath
-              });
-            }
+            if (!isNaN(downloadedNow)) this.downloaded = downloadedNow;
+            if (!isNaN(totalNow) && totalNow > 0) this.size = totalNow;
+
+            this.emit('progress', {
+              id: this.id,
+              downloaded: this.downloaded,
+              total: this.size,
+              speed: speedRaw,
+              eta: etaRaw,
+              outPath: this.outPath
+            });
+
+          } catch (e) {
+            console.error('[yt-dlp parser] Failed to parse progress:', line, e);
           }
         }
       });
 
       subprocess.stderr.on('data', (data) => {
-        this.lastStderr = data.toString();
-        console.error('yt-dlp stderr:', this.lastStderr);
+        const errStr = data.toString();
+        this.lastStderr = errStr;
+        // Suppress JavaScript runtime noise
+        if (!errStr.includes('JavaScript runtime')) {
+          console.error('yt-dlp stderr:', errStr);
+        }
       });
 
       subprocess.on('close', (code) => {
         if (code === 0) {
           this.completed = true;
-          this.emit('finished', { id: this.id, path: this.outPath });
+          this.emit('finished', { id: this.id, path: this.outPath, size: this.downloaded || this.size });
         } else if (!this.aborted) {
           const errorMsg = `yt-dlp failed (code ${code}). ${this.lastStderr || ''}`;
           console.error('[Downloader] YouTube Error:', errorMsg);
@@ -471,10 +474,10 @@ class DownloadTask extends EventEmitter {
               res.destroy();
               return;
             }
-            
+
             const writeOffset = range.start + range.downloaded;
             await this.fileHandle.write(chunk, 0, chunk.length, writeOffset);
-            
+
             range.downloaded += chunk.length;
             this.downloaded += chunk.length;
             // Don't emit per-chunk progress — _startSpeedTicker handles this every 1s with speed included
@@ -488,14 +491,14 @@ class DownloadTask extends EventEmitter {
               }
             }
           }
-          
+
           range.done = range.downloaded >= (range.end - range.start + 1);
           range.inFlight = false;
           // start another range if available
           const nr = nextRange();
           if (nr) startRequestFor(nr);
           this._checkComplete();
-          
+
         } catch (err) {
           res.destroy();
           throw err;

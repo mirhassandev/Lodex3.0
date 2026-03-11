@@ -23,11 +23,25 @@ export function Sidebar({ activeFilter, onFilterChange, onOpenAdvanced, storageU
   ];
 
   return (
-    <div className="w-64 border-r border-border bg-card/30 flex flex-col h-full backdrop-blur-md">
+    <div className="w-64 border-r border-border bg-card/30 flex flex-col h-full backdrop-blur-md relative group">
+      {/* Main Window Controls - Unified Style */}
+      <div className="absolute top-4 right-4 flex gap-2 z-20" style={{ WebkitAppRegion: 'no-drag' } as any}>
+        <button
+          onClick={() => (window as any).electronAPI?.minimize?.()}
+          className="w-3 h-3 rounded-full bg-[#febc2e] hover:bg-[#febc2ecc] border border-[#d8a120] transition-colors"
+          title="Minimize"
+        />
+        <button
+          onClick={() => (window as any).electronAPI?.close?.()}
+          className="w-3 h-3 rounded-full bg-[#ff5f57] hover:bg-[#ff5f57cc] border border-[#e0443e] transition-colors"
+          title="Close"
+        />
+      </div>
+
       <div className="p-6 flex items-center gap-3">
         <div className="w-8 h-8 rounded bg-primary/20 border border-primary/30 flex items-center justify-center overflow-hidden">
-             {/* Use the generated image if available, else fallback */}
-             <img src={generatedLogo} alt="Logo" className="w-full h-full object-cover" />
+          {/* Use the generated image if available, else fallback */}
+          <img src={generatedLogo} alt="Logo" className="w-full h-full object-cover" />
         </div>
         <div className="leading-none">
           <h1 className="font-bold tracking-tight">Nexus</h1>
@@ -44,8 +58,8 @@ export function Sidebar({ activeFilter, onFilterChange, onOpenAdvanced, storageU
               variant={activeFilter === cat.id ? "secondary" : "ghost"}
               className={cn(
                 "w-full justify-start gap-3 h-10 transition-all duration-200",
-                activeFilter === cat.id 
-                  ? "bg-primary/10 text-primary hover:bg-primary/15 font-medium border border-primary/10" 
+                activeFilter === cat.id
+                  ? "bg-primary/10 text-primary hover:bg-primary/15 font-medium border border-primary/10"
                   : "text-muted-foreground hover:text-foreground hover:bg-white/5"
               )}
               onClick={() => onFilterChange(cat.id as any)}
@@ -59,63 +73,63 @@ export function Sidebar({ activeFilter, onFilterChange, onOpenAdvanced, storageU
 
         <div className="mt-8 space-y-1">
           <h2 className="px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Features</h2>
-          <Button 
-            variant="ghost" 
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10" 
+          <Button
+            variant="ghost"
+            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
             data-testid="link-scheduler"
             onClick={() => onOpenAdvanced("scheduler")}
           >
-             <Calendar className="w-4 h-4" />
-             Scheduler
+            <Calendar className="w-4 h-4" />
+            Scheduler
           </Button>
-          <Button 
-            variant="ghost" 
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10" 
+          <Button
+            variant="ghost"
+            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
             data-testid="link-browser"
             onClick={() => onOpenAdvanced("browser")}
           >
-             <Globe className="w-4 h-4" />
-             Browser Integration
+            <Globe className="w-4 h-4" />
+            Browser Integration
           </Button>
-          <Button 
-            variant="ghost" 
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10" 
+          <Button
+            variant="ghost"
+            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
             data-testid="link-proxy"
             onClick={() => onOpenAdvanced("proxy")}
           >
-             <ArrowDownToLine className="w-4 h-4" />
-             Proxy Settings
+            <ArrowDownToLine className="w-4 h-4" />
+            Proxy Settings
           </Button>
-          <Button 
-            variant="ghost" 
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10" 
+          <Button
+            variant="ghost"
+            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
             data-testid="link-drag-drop"
             onClick={() => onOpenAdvanced("browser")}
           >
-             <MousePointer2 className="w-4 h-4" />
-             Drag & Drop
+            <MousePointer2 className="w-4 h-4" />
+            Drag & Drop
           </Button>
         </div>
 
         <div className="mt-8 space-y-1">
           <h2 className="px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Queues</h2>
-          <Button 
-            variant="ghost" 
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10" 
+          <Button
+            variant="ghost"
+            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
             data-testid="link-main-queue"
             onClick={() => onOpenAdvanced("queues")}
           >
-             <div className="w-2 h-2 rounded-full bg-green-500" />
-             Main Queue
+            <div className="w-2 h-2 rounded-full bg-green-500" />
+            Main Queue
           </Button>
-          <Button 
-            variant="ghost" 
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10" 
+          <Button
+            variant="ghost"
+            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
             data-testid="link-scheduled-queue"
             onClick={() => onOpenAdvanced("queues")}
           >
-             <div className="w-2 h-2 rounded-full bg-yellow-500" />
-             Scheduled
+            <div className="w-2 h-2 rounded-full bg-yellow-500" />
+            Scheduled
           </Button>
         </div>
       </div>
