@@ -1,7 +1,11 @@
 import React from 'react';
 import { Minus, Square, X, Download } from 'lucide-react';
 
-export const TitleBar: React.FC = () => {
+interface TitleBarProps {
+  breadcrumb?: string;
+}
+
+export const TitleBar: React.FC<TitleBarProps> = ({ breadcrumb }) => {
   const electronAPI = (window as any).electronAPI;
 
   const handleMinimize = () => {
@@ -22,8 +26,20 @@ export const TitleBar: React.FC = () => {
   const isDialog = window.location.search.includes('dialog=true');
 
   return (
-    <div className={`flex items-center justify-between h-10 bg-background border-b border-border select-none ${isDialog ? 'rounded-t-xl' : ''}`}>
-      <div className="flex-1 h-full cursor-default title-drag" />
+    <div className={`relative flex items-center justify-between h-10 bg-background border-b border-white/5 select-none ${isDialog ? 'rounded-t-xl' : ''}`}>
+      <div className="flex-1 flex items-center px-4 title-drag h-full">
+        {breadcrumb && (
+          <div className="flex items-center gap-2 no-drag">
+             <span className="text-[10px] text-white/20 font-bold uppercase tracking-wider">Library</span>
+             <span className="text-[10px] text-white/10">/</span>
+             <span className="text-[10px] text-primary font-bold uppercase tracking-wider">{breadcrumb}</span>
+          </div>
+        )}
+        {/* Absolute centered title */}
+        <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
+           <span className="text-[11px] font-bold tracking-[0.3em] uppercase text-white/20 select-none">LodexPro</span>
+        </div>
+      </div>
 
       <div className="flex items-center h-full no-drag px-4 gap-2.5">
         <button

@@ -1,20 +1,24 @@
 import React from "react";
-import { Download, MonitorPlay, Music, FileText, Archive, Layers, HardDrive, Calendar, ShieldCheck, Zap, Globe, Lock, ArrowDownToLine, MousePointer2 } from "lucide-react";
+import { Download, MonitorPlay, Music, FileText, Archive, Layers, HardDrive, Calendar, ShieldCheck, Zap, Globe, Lock, ArrowDownToLine, MousePointer2, Cpu, Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { FileType } from "@/lib/mock-data";
 
 
 
 interface SidebarProps {
-  activeFilter: FileType | "all";
-  onFilterChange: (filter: FileType | "all") => void;
+  activeFilter: string;
+  onFilterChange: (filter: any) => void;
   onOpenAdvanced: (tab?: string) => void;
-  storageUsage: number; // percentage
 }
 
 export function Sidebar({ activeFilter, onFilterChange, onOpenAdvanced }: SidebarProps) {
   const [diskInfo, setDiskInfo] = React.useState({ used: 0, total: 0, percent: 0, drive: 'C' });
+  const [queues, setQueues] = React.useState<any[]>([]);
+  const [showAddQueue, setShowAddQueue] = React.useState(false);
+  const [newQueueName, setNewQueueName] = React.useState("");
 
   React.useEffect(() => {
     const fetchDiskInfo = async () => {
@@ -32,6 +36,35 @@ export function Sidebar({ activeFilter, onFilterChange, onOpenAdvanced }: Sideba
     return () => clearInterval(interval);
   }, []);
 
+  const fetchQueues = async () => {
+    try {
+      const res = await fetch('/api/queues');
+      if (res.ok) setQueues(await res.json());
+    } catch (e) {}
+  };
+
+  React.useEffect(() => {
+    fetchQueues();
+    const interval = setInterval(fetchQueues, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleAddQueue = async () => {
+    if (!newQueueName) return;
+    try {
+      const res = await fetch('/api/queues', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newQueueName })
+      });
+      if (res.ok) {
+        fetchQueues();
+        setNewQueueName("");
+        setShowAddQueue(false);
+      }
+    } catch (e) {}
+  };
+
   const formatSize = (bytes: number) => {
     if (bytes === 0) return '0 B';
     const k = 1024;
@@ -46,6 +79,7 @@ export function Sidebar({ activeFilter, onFilterChange, onOpenAdvanced }: Sideba
     { id: "audio", label: "Music", icon: Music },
     { id: "archive", label: "Compressed", icon: Archive },
     { id: "document", label: "Documents", icon: FileText },
+    { id: "program", label: "Programs", icon: Cpu },
   ];
 
   return (
@@ -53,18 +87,7 @@ export function Sidebar({ activeFilter, onFilterChange, onOpenAdvanced }: Sideba
       {/* Main Window Controls - Unified Style */}
 
 
-      <div className="p-6 flex items-center gap-3">
-        <div className="w-8 h-8 rounded bg-primary/20 border border-primary/30 flex items-center justify-center overflow-hidden">
-          {/* Use the new logo */}
-          <img src="/logo2.0.png" alt="Logo" className="w-full h-full object-cover" />
-        </div>
-        <div className="leading-none">
-          <h1 className="font-bold tracking-tight">Nexus</h1>
-          <span className="text-[10px] text-primary font-mono tracking-widest uppercase">Manager</span>
-        </div>
-      </div>
-
-      <div className="px-3 py-2 flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto pt-4 px-3">
         <div className="space-y-1">
           <h2 className="px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Library</h2>
           {categories.map((cat) => (
@@ -106,46 +129,69 @@ export function Sidebar({ activeFilter, onFilterChange, onOpenAdvanced }: Sideba
             <Globe className="w-4 h-4" />
             Browser Integration
           </Button>
-          <Button
-            variant="ghost"
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
-            data-testid="link-proxy"
-            onClick={() => onOpenAdvanced("proxy")}
-          >
-            <ArrowDownToLine className="w-4 h-4" />
-            Proxy Settings
-          </Button>
-          <Button
-            variant="ghost"
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
-            data-testid="link-drag-drop"
-            onClick={() => onOpenAdvanced("browser")}
-          >
-            <MousePointer2 className="w-4 h-4" />
-            Drag & Drop
-          </Button>
         </div>
 
         <div className="mt-8 space-y-1">
-          <h2 className="px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Queues</h2>
-          <Button
-            variant="ghost"
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
-            data-testid="link-main-queue"
-            onClick={() => onOpenAdvanced("queues")}
-          >
-            <div className="w-2 h-2 rounded-full bg-green-500" />
-            Main Queue
-          </Button>
-          <Button
-            variant="ghost"
-            className="w-full justify-start gap-3 text-muted-foreground hover:text-foreground hover:bg-white/5 h-10"
-            data-testid="link-scheduled-queue"
-            onClick={() => onOpenAdvanced("queues")}
-          >
-            <div className="w-2 h-2 rounded-full bg-yellow-500" />
-            Scheduled
-          </Button>
+          <div className="flex items-center justify-between px-4 mb-2">
+            <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Queues</h2>
+            <Button 
+                variant="ghost" 
+                size="icon" 
+                className="w-5 h-5 text-primary hover:bg-primary/10 rounded-full"
+                onClick={() => setShowAddQueue(true)}
+                title="Add New Queue"
+            >
+                <Plus className="w-3 h-3" />
+            </Button>
+          </div>
+
+          <Dialog open={showAddQueue} onOpenChange={setShowAddQueue}>
+            <DialogContent className="sm:max-w-md bg-slate-900/95 backdrop-blur-xl border-white/5 text-foreground shadow-2xl">
+              <DialogHeader>
+                <DialogTitle className="text-xl font-bold">New Queue</DialogTitle>
+                <DialogDescription className="text-white/40">Create a new category to organize your transfers.</DialogDescription>
+              </DialogHeader>
+              <div className="py-4">
+                <Input 
+                  value={newQueueName}
+                  onChange={(e) => setNewQueueName(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleAddQueue()}
+                  placeholder="e.g. Work, Movies, Linux ISOs..."
+                  className="bg-white/5 border-white/10 h-12 focus:ring-primary/40 rounded-xl"
+                  autoFocus
+                />
+              </div>
+              <DialogFooter>
+                <Button variant="ghost" onClick={() => setShowAddQueue(false)}>Cancel</Button>
+                <Button onClick={handleAddQueue} className="bg-primary hover:bg-primary/90 font-bold px-6">Create Queue</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          
+          {queues.map((q) => {
+            const filterId = `queue-${q.id}`;
+            const isActive = activeFilter === filterId;
+            return (
+              <Button
+                key={q.id}
+                variant={isActive ? "secondary" : "ghost"}
+                className={cn(
+                  "w-full justify-start gap-3 h-10 transition-all duration-200",
+                  isActive
+                    ? "bg-primary/10 text-primary hover:bg-primary/15 font-medium border border-primary/10"
+                    : "text-muted-foreground hover:text-foreground hover:bg-white/5"
+                )}
+                onClick={() => onFilterChange(filterId)}
+              >
+                <div className={cn(
+                    "w-2 h-2 rounded-full", 
+                    q.id === 1 ? "bg-green-500/40" : "bg-primary/40",
+                    isActive && (q.id === 1 ? "bg-green-400 shadow-[0_0_8px_rgba(74,222,128,0.5)]" : "bg-primary shadow-[0_0_8px_rgba(var(--primary),0.5)]")
+                )} />
+                {q.name}
+              </Button>
+            );
+          })}
         </div>
       </div>
 
