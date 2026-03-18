@@ -1,895 +1,258 @@
-'use strict';
-
-const EventEmitter = require('events');
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
+const { spawn } = require('child_process');
 const path = require('path');
-const { URL } = require('url');
+const fs = require('fs');
 
-const { StreamTask } = require('./stream-downloader.cjs');
-const { classify } = require('./url-classifier.cjs');
-const { SegmentedDownloader } = require('./segmented-downloader.cjs');
-const { QueueManager } = require('./queue-manager.cjs');
-const { requestWithRedirect, headWithRedirect } = require('./request-utils.cjs');
-const { getYtdlpPath } = require('./ytdlp-wrapper.cjs');
+/**
+ * REGEX HELPERS
+ * Captures percentages from various CLI tools.
+ */
+const REGEX = {
+  // yt-dlp: [download]  10.5% of ... (flexible for double spaces)
+  YTDLP: /\[download\]\s+(\d+\.\d+)%/,
+  // aria2c: (10%) or [10%]
+  ARIA2: /\((\d+)%\)/,
+  // surge: 10.5% (generic catch-all)
+  SURGE: /(\d+(\.\d+)?)%/,
+  // Filename targets
+  FILENAME_YTDLP: /\[download\] Destination:\s+(.+)/,
+  FILENAME_YTDLP_EXIST: /\[download\]\s+(.+)\s+has already been downloaded/,
+  FILENAME_ARIA2: /FILE:\s+(.+)/,
+  FILENAME_ARIA2_RENAMED: /Renamed to\s+(.+)\./,
+  FILENAME_SURGE: /Download target:\s+(.+)/,
+  ID_SURGE: /([a-f0-9]{8})\s+.+/
+};
 
-class DownloadTask extends EventEmitter {
-  constructor(id, url, outPath, options = {}) {
-    super();
-    this.id = id;
-    this.url = url;
-    this.outPath = outPath;
-    this.options = options;
-    this.status = 'queued';
-    this.aborted = false;
-    this.completed = false; // Explicit completion status
-    this.error = null;
-    this.connections = options.connections || 8;
-    this.timeout = options.timeout || 15000;
-    this.requests = [];
-    this.size = 0;
-    this.downloaded = 0;
-    this.ranges = [];
-    this.fileHandle = null;
-    this.manifestPath = `${outPath}.download.meta`;
-    this.ytdlStream = null;
-    this.resolution = options.resolution;
-    this.title = options.title;
-    this.customHeaders = options.headers || {};
+/**
+ * SPEED EXTRACTION HELPERS
+ */
+const SPEED_REGEX = {
+  YTDLP: /at\s+([\d.]+\w+\/s)/,
+  ARIA2: /DL:([\d.]+\w+)/,
+  SURGE: /([\d.]+\w+\/s)/
+};
 
-    this.speedInterval = null;
-    this.speedLimit = 0; // 0 = unlimited
+/**
+ * PATH RESOLVER
+ * Ensures binaries are found in dev and packaged builds.
+ */
+const getBinPath = () => {
+  // Try project root resources first (dev)
+  const devPath = path.join(process.cwd(), 'resources', 'bin');
+  if (fs.existsSync(devPath)) return devPath;
+
+  // Fallback to packaged resources path
+  const prodPath = path.join(process.resourcesPath, 'bin');
+  return prodPath;
+};
+
+/**
+ * ENGINE ROUTER
+ * Simple logic to decide which binary to use based on URL.
+ */
+function getEngineType(url) {
+  const videoSites = [
+    'youtube.com', 'youtu.be', 'facebook.com', 'fb.watch', 
+    'instagram.com', 'tiktok.com', 'twitter.com', 'x.com', 
+    'vimeo.com', 'dailymotion.com'
+  ];
+  
+  if (videoSites.some(site => url.includes(site))) return 'yt-dlp';
+  
+  return 'surge'; // Re-prioritize surge for direct/p2p downloads
+}
+
+/**
+ * MAIN DOWNLOAD FUNCTION
+ * @returns {ChildProcess} - The spawned process for management
+ */
+function startDownload(url, callbacks) {
+  const { onProgress, onComplete, onError, onFilename, onEngineId } = callbacks;
+  let filenameFound = false;
+  const binDir = getBinPath();
+  const type = getEngineType(url);
+
+  // Ensure downloads directory exists
+  const downloadsDir = path.resolve(process.cwd(), 'downloads');
+  if (!fs.existsSync(downloadsDir)) {
+    fs.mkdirSync(downloadsDir, { recursive: true });
   }
+  
+  // Resolve binary paths
+  const ENGINES = {
+    'yt-dlp': path.join(binDir, 'yt-dlp.exe'),
+    'aria2c': path.join(binDir, 'aria2c.exe'),
+    'surge': path.join(binDir, 'surge.exe'),
+    'ffmpeg': path.join(binDir, 'ffmpeg.exe')
+  };
 
-  throttle(limit) {
-    this.speedLimit = limit;
-    console.log(`[DownloadTask] Throttling for ${this.id}: ${limit} B/s`);
-  }
+  let cmd = ENGINES[type];
+  let args = [];
 
-  async headRequest() {
-    try {
-      return await headWithRedirect(this.url, this.customHeaders, this.timeout);
-    } catch (err) {
-      console.warn(`[DownloadTask] Head request failed for ${this.id}, falling back to GET:`, err.message);
-      return { length: 0, acceptRanges: false, headers: {} };
-    }
-  }
+  if (type === 'surge') {
+     // Pre-emptive purge: check if surge already has this file completed
+     // This prevents the "done instantly" issue when the file was already downloaded/broken.
+     try {
+       const { execSync } = require('child_process');
+       const lsOutput = execSync(`"${ENGINES['surge']}" ls`, { windowsHide: true }).toString();
+       const lines = lsOutput.split('\n');
+       
+       // Try to extract filename from URL
+       const fileNameFromUrl = url.split('/').pop()?.split('?')[0] || '';
+       
+       lines.forEach(line => {
+         const parts = line.trim().split(/\s{2,}/);
+         if (parts.length >= 3) {
+            const surgeId = parts[0];
+            const surgeFileName = parts[1];
+            const surgeStatus = parts[2].toLowerCase();
+            
+            // If the filename matches and it's completed, remove it to force fresh download
+            const urlPath = fileNameFromUrl.toLowerCase();
+            const surgeName = surgeFileName.toLowerCase();
 
-  splitRanges(total, parts) {
-    const ranges = [];
-    const partSize = Math.floor(total / parts);
-    let start = 0;
-    for (let i = 0; i < parts; i++) {
-      const end = i === parts - 1 ? total - 1 : start + partSize - 1;
-      ranges.push({ start, end, downloaded: 0, done: false });
-      start = end + 1;
-    }
-    return ranges;
-  }
-
-  async start() {
-    // Note: QueueManager might set status to 'downloading' BEFORE calling start()
-    // so we shouldn't bail out here if already 'downloading'.
-
-    this.status = 'downloading';
-    console.log(`[DownloadTask] Starting task: ${this.id} (${this.url.substring(0, 50)}...)`);
-
-    // Emit early started so UI shows connecting/downloading status
-    this.emit('started', { id: this.id, size: this.size || 0 });
-
-    try {
-      // Routing Strategy: Route to advanced handlers (ytdlp/hls/dash)
-      const isYtdlDomain = this.url.includes('youtube.com') || this.url.includes('youtu.be') || 
-                           this.url.includes('facebook.com') || this.url.includes('instagram.com') ||
-                           this.url.includes('twitter.com') || this.url.includes('x.com') ||
-                           this.url.includes('tiktok.com') || this.url.includes('dailymotion.com');
-
-      if (isYtdlDomain || this.options.requiresYtdl || this.options.type === 'youtube' || this.protocol === 'ytdlp') {
-        console.log(`[DownloadTask] Routed to advanced (yt-dlp) handler: ${this.id}`);
-        this._startSpeedTicker();
-        return await this._startYouTubeDownload();
-      }
-
-
-      console.log(`[DownloadTask] Probing server: ${this.id}`);
-
-      const startTimeout = setTimeout(() => {
-        if (this.status === 'downloading' && this.downloaded === 0) {
-          console.error(`[DownloadTask] Start timeout for ${this.id}`);
-          this.emit('error', new Error('Connection timed out during start'));
-          this.cancel();
-        }
-      }, 30000);
-
-      const head = await this.headRequest();
-
-      if (head.finalUrl && head.finalUrl !== this.url) {
-        console.log(`[DownloadTask] Redirect detected: ${this.url} -> ${head.finalUrl}`);
-        this.url = head.finalUrl;
-      }
-
-      this.once('progress', () => clearTimeout(startTimeout));
-      this.once('finished', () => clearTimeout(startTimeout));
-      this.once('error', () => clearTimeout(startTimeout));
-
-      // If we got content-length and server supports ranges, use segmented download
-      if (head.size > 0 && head.acceptRanges) {
-        console.log(`[DownloadTask] Range support detected. Size: ${head.size}`);
-        this.size = head.size;
-
-        // Dynamic segmentation strategy based on file size
-        if (this.size > 1024 * 1024 * 1024) this.connections = 16;
-        else if (this.size > 100 * 1024 * 1024) this.connections = 8;
-        else if (this.size > 10 * 1024 * 1024) this.connections = 4;
-        else this.connections = 2;
-
-        this.ranges = this.splitRanges(this.size, this.connections);
-
-        // create or truncate output file to the full size
-        await fs.promises.writeFile(this.outPath, Buffer.alloc(1), { flag: 'w' });
-        const fd = await fs.promises.open(this.outPath, 'r+');
-        this.fileHandle = fd;
-
-        this.emit('started', { id: this.id, size: this.size }); // Update with real size
-        this._startSpeedTicker();
-        this._runRanges();
-      } else {
-        // Fallback to simple streaming download (for video hosts, etc.)
-        console.log(`[DownloadTask] No range support. Falling back to stream: ${this.id}`);
-        this._startSpeedTicker();
-        return await this._streamDownload();
-      }
-    } catch (err) {
-      console.error(`[DownloadTask] Start failed critically for ${this.id}:`, err.message);
-      this.emit('error', err);
-    }
-  }
-
-  _startSpeedTicker() {
-    if (this.speedInterval) clearInterval(this.speedInterval);
-    this.lastDownloaded = this.downloaded || 0;
-    this.speedHistory = [];
-
-    this.speedInterval = setInterval(() => {
-      if (this.aborted || this.completed) {
-        clearInterval(this.speedInterval);
-        return;
-      }
-
-      const downloadedNow = this.downloaded || 0;
-      const bytesPerSec = downloadedNow - this.lastDownloaded;
-      this.lastDownloaded = downloadedNow;
-
-      this.speedHistory.push(bytesPerSec);
-      if (this.speedHistory.length > 5) this.speedHistory.shift();
-
-      const avgSpeed = this.speedHistory.length > 0 ? this.speedHistory.reduce((a, b) => a + b, 0) / this.speedHistory.length : 0;
-      const remainingBytes = this.size > 0 ? this.size - downloadedNow : 0;
-      const eta = avgSpeed > 0 ? Math.round(remainingBytes / avgSpeed) : 0;
-
-      // Ensure we only emit progress if size is known or we're streaming
-      this.emit('progress', {
-        id: this.id,
-        downloaded: downloadedNow,
-        total: this.size,
-        speed: avgSpeed,
-        eta: eta
-      });
-    }, 1000);
-  }
-
-  async _startYouTubeDownload() {
-    try {
-      this.emit('started', { id: this.id, size: 0 });
-
-      const { spawn } = require('child_process');
-      const path = require('path');
-      const ytpPath = getYtdlpPath();
-      const os = require('os');
-      const fs = require('fs');
-
-      // Ensure directory exists
-      const dir = path.dirname(this.outPath);
-      if (!fs.existsSync(dir)) {
-        console.log(`[Downloader] Creating directory: ${dir}`);
-        fs.mkdirSync(dir, { recursive: true });
-      }
-
-      // Workaround: Copy ffmpeg to temp dir to avoid spaces in path which yt-dlp hates
-      const sourceFfmpeg = require('ffmpeg-static');
-      const tempFfmpeg = path.join(os.tmpdir(), 'ffmpeg.exe');
-
-      if (!fs.existsSync(tempFfmpeg)) {
-        console.log('[Downloader] Copying ffmpeg to temp:', tempFfmpeg);
-        fs.copyFileSync(sourceFfmpeg, tempFfmpeg);
-      }
-      const ffmpegPath = tempFfmpeg;
-      console.log('[Downloader] Using temp ffmpegPath:', ffmpegPath);
-
-      // 1. Resolve format strategy
-      let formatStr = 'best';
-      const extractionArgs = [];
-
-      if (this.options.isAudioOnly || this.options.quality === 'audio') {
-        const isMP3 = this.options.isAudioOnly && this.options.filename.toLowerCase().endsWith('.mp3');
-        formatStr = 'bestaudio/best';
-
-        if (isMP3) {
-          extractionArgs.push('--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0');
-        }
-      } else {
-        const height = this.resolution ? parseInt(this.resolution, 10) : 1080;
-        formatStr = `bestvideo[height<=?${height}]+bestaudio/best[height<=?${height}]`;
-      }
-
-      // Respect custom headers (Cookies, Referer, etc.)
-      const headerArgs = [];
-      Object.entries(this.customHeaders).forEach(([key, value]) => {
-        if (value) {
-          headerArgs.push('--add-header', `${key}:${value}`);
-        }
-      });
-
-      const args = [
-        '--no-warnings',
-        '--no-check-certificate',
-        '--no-playlist',
-        '--format', formatStr,
-        '--ffmpeg-location', ffmpegPath,
-        '--js-runtimes', 'node',
-        ...extractionArgs,
-        '--output', this.outPath,
-        '--force-overwrites',
-        '--newline',
-        '--continue',
-        '--progress',
-        '--progress-template', 'download:[NEXUS_PROGRESS] %(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s',
-        ...headerArgs,
-        this.url
-      ].filter(arg => arg !== '');
-
-
-      // Add merge-output-format only if not extracting audio
-      if (extractionArgs.length === 0) {
-        args.push('--merge-output-format', 'mp4');
-      }
-
-      // Add default headers if not provided
-      if (!this.customHeaders['Referer'] && !this.customHeaders['referer']) {
-        try {
-          const u = new URL(this.url);
-          args.push('--add-header', `referer:${u.protocol}//${u.host}/`);
-        } catch {
-          args.push('--add-header', 'referer:https://www.google.com/');
-        }
-      }
-
-      console.log('[Downloader] Spawning yt-dlp with args:', args.join(' '));
-      const subprocess = spawn(ytpPath, args);
-      this.ytdlStream = subprocess;
-
-      subprocess.on('spawn', () => {
-        console.log(`[DownloadTask] YouTube downloader started (PID: ${subprocess.pid})`);
-      });
-
-      subprocess.stdout.on('data', (data) => {
-        const lines = data.toString().trim().split('\n');
-
-        for (const rawLine of lines) {
-          const line = rawLine.trim();
-          if (!line) continue;
-
-          if (!line.includes('[NEXUS_PROGRESS]')) {
-            console.log(`[yt-dlp] ${line}`);
-            continue;
-          }
-
-          // New format: download:[NEXUS_PROGRESS] 12345|67890|456|12
-          // It's possible for values to be 'NA' or missing initially
-          try {
-            const parts = line.split('[NEXUS_PROGRESS] ')[1];
-            if (!parts) continue;
-
-            const [dlStr, totalStr, speedStr, etaStr] = parts.split('|');
-
-            let downloadedNow = dlStr !== 'NA' ? parseInt(dlStr, 10) : 0;
-            let totalNow = totalStr !== 'NA' ? parseInt(totalStr, 10) : this.size || 0;
-            let speedRaw = speedStr !== 'NA' ? parseFloat(speedStr) : 0;
-            let etaRaw = etaStr !== 'NA' ? parseInt(etaStr, 10) : -1;
-
-            if (!isNaN(downloadedNow)) this.downloaded = downloadedNow;
-            if (!isNaN(totalNow) && totalNow > 0) this.size = totalNow;
-
-            this.emit('progress', {
-              id: this.id,
-              downloaded: this.downloaded,
-              total: this.size,
-              speed: speedRaw,
-              eta: etaRaw,
-              outPath: this.outPath
-            });
-
-          } catch (e) {
-            console.error('[yt-dlp parser] Failed to parse progress:', line, e);
-          }
-        }
-      });
-
-      subprocess.stderr.on('data', (data) => {
-        const errStr = data.toString();
-        this.lastStderr = (this.lastStderr || '') + errStr;
-        // Suppress JavaScript runtime noise but log actual errors
-        if (!errStr.includes('JavaScript runtime') && !errStr.includes('Extracting')) {
-          console.error(`[yt-dlp-error] ${this.id}:`, errStr);
-        }
-      });
-
-
-      subprocess.on('close', (code) => {
-        if (code === 0) {
-          this.completed = true;
-          this.emit('finished', { id: this.id, path: this.outPath, size: this.downloaded || this.size });
-        } else if (!this.aborted) {
-          const errorMsg = `yt-dlp failed (code ${code}). ${this.lastStderr || ''}`;
-          console.error('[Downloader] YouTube Error:', errorMsg);
-          this.emit('error', new Error(errorMsg));
-        }
-      });
-
-      subprocess.on('error', (err) => {
-        if (!this.aborted) this.emit('error', err);
-      });
-
-    } catch (err) {
-      if (this.aborted) return;
-      this.emit('error', err);
-    }
-  }
-
-  async _streamDownload() {
-    try {
-      const finalHeaders = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-        'Accept': 'application/octet-stream, */*',
-        ...this.customHeaders
-      };
-
-      if (!finalHeaders.Referer && !finalHeaders.referer) {
-        try {
-          const u = new URL(this.url);
-          finalHeaders.Referer = `${u.protocol}//${u.host}/`;
-        } catch {}
-      }
-
-      const res = await requestWithRedirect(this.url, {
-        method: 'GET',
-        headers: finalHeaders,
-        timeout: this.timeout
-      });
-
-      if (res.statusCode >= 400) {
-        res.resume();
-        throw new Error(`HTTP ${res.statusCode}`);
-      }
-
-      // Update URL to final direct target if it redirected
-      if (res.finalUrl && res.finalUrl !== this.url) {
-        this.url = res.finalUrl;
-      }
-
-      const contentType = (res.headers['content-type'] || '').toLowerCase();
-      const urlPath = new URL(this.url).pathname.toLowerCase();
-      const isLikelyBinary = /\.(exe|dmg|iso|zip|tar|gz|msi|apk|pkg|deb|rpm|7z|rar|bin|img)/.test(urlPath);
-
-      // Detect mirror-selector pages (like get.videolan.org) that return HTML instead of the file
-      if (contentType.includes('text/html') && isLikelyBinary) {
-        // Buffer up to 8KB to look for meta-refresh or direct download link
-        console.log(`[DownloadTask] HTML detected for binary URL on ${this.id}. Scanning for redirect...`);
-        const chunks = [];
-        let totalRead = 0;
-        await new Promise((resolve) => {
-          res.on('data', (chunk) => {
-            if (totalRead < 8192) {
-              chunks.push(chunk);
-              totalRead += chunk.length;
-            } else {
-              res.destroy();
-              resolve();
+            if (surgeName.includes(urlPath) && (surgeStatus === 'completed' || surgeStatus === 'finished')) {
+               console.log(`[Surge] Purging existing task: ${surgeId} (${surgeFileName})`);
+               execSync(`"${ENGINES['surge']}" rm ${surgeId}`, { windowsHide: true });
             }
-          });
-          res.on('end', resolve);
-          res.on('error', resolve);
-        });
-        const html = Buffer.concat(chunks).toString('utf8');
-        // Look for meta-refresh redirect: <meta http-equiv="refresh" content="0; url=...">
-        const metaMatch = html.match(/content=["'][\d.]+;\s*url=([^"']+)["']/i);
-        if (metaMatch) {
-          let redirectUrl = metaMatch[1].trim();
-          if (!redirectUrl.startsWith('http')) {
-            redirectUrl = new URL(redirectUrl, this.url).href;
-          }
-          console.log(`[DownloadTask] Meta-refresh redirect found: ${redirectUrl}`);
-          this.url = redirectUrl;
-          return this._streamDownload(); // retry with new URL
-        }
-        // No redirect found — surface error to user
-        throw new Error('URL leads to a web page, not a direct download. Please copy the direct download link.');
-      }
-
-      const contentLength = parseInt(res.headers['content-length'] || '0', 10);
-      if (contentLength > 0) {
-        this.size = contentLength;
-        this.emit('started', { id: this.id, size: contentLength });
-      } else {
-        this.emit('started', { id: this.id, size: 0 });
-      }
-
-      const writeStream = fs.createWriteStream(this.outPath);
-
-      res.on('data', (chunk) => {
-        if (this.aborted || this.completed) {
-          res.destroy();
-          writeStream.destroy();
-          return;
-        }
-        this.downloaded += chunk.length;
-        // Speed and progress is reported by _startSpeedTicker every 1s
-        if (!this.size && contentLength === 0) {
-          // Unknow size: update best-effort from running bytes
-          this.size = this.downloaded; // will be corrected on next tick
-        }
-      });
-
-      res.pipe(writeStream);
-
-      writeStream.on('finish', () => {
-        if (!this.aborted) {
-          this.completed = true;
-          if (this.speedInterval) clearInterval(this.speedInterval);
-          this.emit('finished', { id: this.id, path: this.outPath, size: this.downloaded });
-        }
-      });
-
-      writeStream.on('error', (err) => {
-        this.emit('error', err);
-      });
-
-      res.on('error', (err) => {
-        if (!this.aborted) this.emit('error', err);
-      });
-    } catch (err) {
-      this.emit('error', err);
-    }
+         }
+       });
+     } catch (e) {
+       console.error('[Surge] Purge failed:', e.message);
+     }
   }
 
-  async _runRanges() {
-    // Use directUrl if set (for YouTube), otherwise this.url
-    const useUrl = this.directUrl || this.url;
-    const urlObj = new URL(useUrl);
-    const lib = urlObj.protocol === 'https:' ? https : http;
+  // Argument Routing
+  if (type === 'yt-dlp') {
+    args = [
+      url, 
+      '--newline', 
+      '--ffmpeg-location', ENGINES['ffmpeg'],
+      '-o', '%(title)s.%(ext)s'
+    ];
+  } else if (type === 'surge') {
+    // surge get/add is the command to queue a download
+    args = ['get', '--output', downloadsDir, url];
+  } else if (type === 'aria2c') {
+    // --summary-interval=1 for frequent progress updates
+    args = [url, '--summary-interval=1', '--dir', downloadsDir];
+  }
 
-    const active = [];
+  console.log(`[Downloader] Spawning ${type}: ${cmd} ${args.join(' ')}`);
 
-    const nextRange = () => this.ranges.find(r => !r.done && !r.inFlight);
+  const child = spawn(cmd, args);
 
-    const startRequestFor = async (range) => {
-      if (this.aborted || this.completed) return;
-      range.inFlight = true;
+  child.stdout.on('data', (data) => {
+    const output = data.toString().replace(/\r/g, '\n'); // Normalize carriage returns
+    let progressMatch, speedMatch;
 
-      try {
-        const finalHeaders = {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-          ...this.customHeaders
-        };
+    if (type === 'yt-dlp') {
+      progressMatch = output.match(REGEX.YTDLP);
+      speedMatch = output.match(SPEED_REGEX.YTDLP);
+    } else if (type === 'aria2c') {
+      progressMatch = output.match(REGEX.ARIA2);
+      speedMatch = output.match(SPEED_REGEX.ARIA2);
+    } else {
+      progressMatch = output.match(REGEX.SURGE);
+      speedMatch = output.match(SPEED_REGEX.SURGE);
+    }
 
-        if (!finalHeaders.Referer && !finalHeaders.referer) {
+    if (progressMatch) {
+      onProgress({
+        percentage: parseFloat(progressMatch[1]),
+        speed: speedMatch ? speedMatch[1] : 'Calculating...',
+        engine: type,
+        raw: output.trim()
+      });
+    }
+
+    if (type === 'surge') {
+      const idMatch = output.match(REGEX.ID_SURGE);
+      if (idMatch && idMatch[1] && onEngineId) {
+        onEngineId(idMatch[1]);
+      }
+    }
+
+    // Filename detection (only emit once)
+    if (onFilename && !filenameFound) {
+      let nameMatch;
+      if (type === 'yt-dlp') {
+        nameMatch = output.match(REGEX.FILENAME_YTDLP) || output.match(REGEX.FILENAME_YTDLP_EXIST);
+      } else if (type === 'aria2c') {
+        nameMatch = output.match(REGEX.FILENAME_ARIA2) || output.match(REGEX.FILENAME_ARIA2_RENAMED);
+      } else if (type === 'surge') {
+        nameMatch = output.match(REGEX.FILENAME_SURGE);
+      }
+
+      if (nameMatch && nameMatch[1]) {
+        const detectedName = path.basename(nameMatch[1].trim());
+        if (detectedName && detectedName !== 'download') {
+          console.log(`[Downloader] Detected filename: ${detectedName}`);
+          filenameFound = true;
+          onFilename(detectedName);
+        }
+      }
+    }
+  });
+
+  child.stderr.on('data', (data) => {
+    console.error(`[${type} Error]: ${data}`);
+  });
+
+  child.on('close', (code) => {
+    console.log(`[Downloader] ${type} finished with code ${code}`);
+    if (code === 0) {
+      // Special handling for surge: strip .surge extension if present
+      if (type === 'surge') {
+        // Wait a bit for file handles to be released
+        setTimeout(() => {
           try {
-            const u = new URL(this.url);
-            finalHeaders.Referer = `${u.protocol}//${u.host}/`;
-          } catch {}
-        }
-
-        const res = await requestWithRedirect(this.url, {
-          method: 'GET',
-          headers: {
-            'Range': `bytes=${range.start + range.downloaded}-${range.end}`,
-            ...finalHeaders
-          },
-          timeout: 120000 // 2 minutes idle timeout instead of 15 seconds
-        });
-
-        if (res.statusCode >= 400) {
-          throw new Error(`HTTP ${res.statusCode}`);
-        }
-
-        try {
-          for await (const chunk of res) {
-            if (this.aborted || this.completed) {
-              res.destroy();
-              return;
-            }
-
-            const writeOffset = range.start + range.downloaded;
-            await this.fileHandle.write(chunk, 0, chunk.length, writeOffset);
-
-            range.downloaded += chunk.length;
-            this.downloaded += chunk.length;
-            // Don't emit per-chunk progress — _startSpeedTicker handles this every 1s with speed included
-
-            // Throttling Logic for segmented ranges
-            if (this.speedLimit > 0) {
-              const sharedLimit = this.speedLimit / this.connections;
-              const delay = (chunk.length / sharedLimit) * 1000;
-              if (delay > 2) {
-                await new Promise(r => setTimeout(r, Math.min(delay, 2000)));
+            const files = fs.readdirSync(downloadsDir);
+            files.forEach(file => {
+              if (file.endsWith('.surge')) {
+                const oldPath = path.join(downloadsDir, file);
+                const newName = file.replace(/\.surge$/, '');
+                const newPath = path.join(downloadsDir, newName);
+                
+                if (fs.existsSync(oldPath)) {
+                  console.log(`[Downloader] Attempting rename: ${file} -> ${newName}`);
+                  try {
+                    if (fs.existsSync(newPath)) fs.unlinkSync(newPath);
+                    fs.renameSync(oldPath, newPath);
+                    console.log(`[Downloader] Successfully renamed to ${newName}`);
+                  } catch (e) {
+                    console.error(`[Downloader] Immediate rename failed (locked?), will retry in 2s...`);
+                    setTimeout(() => {
+                      try {
+                        if (fs.existsSync(oldPath)) {
+                           if (fs.existsSync(newPath)) fs.unlinkSync(newPath);
+                           fs.renameSync(oldPath, newPath);
+                           console.log(`[Downloader] Retry rename successful: ${newName}`);
+                        }
+                      } catch (e2) {
+                        console.error('[Downloader] Final rename retry failed:', e2.message);
+                      }
+                    }, 2000);
+                  }
+                }
               }
-            }
+            });
+          } catch (e) {
+            console.error('[Downloader] Directory read failed during rename:', e);
           }
-
-          range.done = range.downloaded >= (range.end - range.start + 1);
-          range.inFlight = false;
-          // start another range if available
-          const nr = nextRange();
-          if (nr) startRequestFor(nr);
-          this._checkComplete();
-
-        } catch (err) {
-          res.destroy();
-          throw err;
-        }
-
-      } catch (err) {
-        range.inFlight = false;
-        this.emit('error', err);
+        }, 800);
       }
-    };
-
-    // kick off up to connections requests
-    for (let i = 0; i < this.connections; i++) {
-      const r = nextRange();
-      if (!r) break;
-      startRequestFor(r);
-    }
-  }
-
-  _checkComplete() {
-    if (this.ranges.every(r => r.done)) {
-      this.completed = true;
-      if (this.speedInterval) clearInterval(this.speedInterval);
-      this.emit('finished', { id: this.id, path: this.outPath, size: this.size });
-      if (this.fileHandle) this.fileHandle.close().catch(() => { });
-      fs.unlink(this.manifestPath, () => { });
-    }
-  }
-
-  pause() {
-    this.aborted = true;
-    for (const req of this.requests) {
-      try { req.destroy(); } catch (e) { }
-    }
-    this.requests = [];
-
-    if (this.ytdlStream) {
-      try {
-        if (typeof this.ytdlStream.kill === 'function') {
-          this.ytdlStream.kill('SIGKILL');
-        } else {
-          this.ytdlStream.destroy();
-        }
-      } catch (e) { }
-      this.ytdlStream = null;
-    }
-
-    if (this.fileHandle) {
-      this.fileHandle.close().catch(() => { });
-    }
-
-    // Save state including directUrl if needing resume (simple resume might fail if link expired)
-    // But for now, save ranges.
-    if (this.ranges && this.ranges.length > 0) {
-      fs.writeFileSync(this.manifestPath, JSON.stringify({
-        url: this.url,
-        directUrl: this.directUrl, // Save direct URL
-        outPath: this.outPath,
-        size: this.size,
-        ranges: this.ranges
-      }));
-    }
-    this.emit('paused', { id: this.id });
-  }
-
-  resume() {
-    if (this.ranges && this.ranges.length > 0) {
-      // Segmented download - resume from manifest
-      if (!fs.existsSync(this.manifestPath)) {
-        this.emit('error', new Error('No partial meta file found to resume'));
-        return;
-      }
-      const manifest = JSON.parse(fs.readFileSync(this.manifestPath, 'utf-8'));
-      this.url = manifest.url;
-      this.outPath = manifest.outPath;
-      this.size = manifest.size;
-      this.ranges = manifest.ranges;
-      this.directUrl = manifest.directUrl; // Restore direct URL
-      this.aborted = false;
-      this.completed = false;
-
-      // Calculate downloaded so far from ranges
-      this.downloaded = this.ranges.reduce((acc, r) => acc + r.downloaded, 0);
-
-      // We must reopen the file handle for random writes
-      fs.promises.open(this.outPath, 'r+').then(fd => {
-        this.fileHandle = fd;
-        this._startSpeedTicker();
-        this._runRanges();
-      }).catch(err => {
-        this.emit('error', new Error('Failed to open file for resume: ' + err.message));
-      });
-
+      onComplete();
     } else {
-      // Streaming download - cannot resume, start fresh
-      this.downloaded = 0;
-      this.aborted = false;
-      this.completed = false;
-      if (this.url.includes('youtube.com') || this.url.includes('youtu.be')) {
-        this._startSpeedTicker();
-        this._startYouTubeDownload();
-      } else {
-        this._startSpeedTicker();
-        this._streamDownload();
-      }
+      onError(new Error(`${type} exited with code ${code}`));
     }
-    this.emit('resumed', { id: this.id, downloaded: this.downloaded });
-  }
+  });
 
-  cancel() {
-    this.pause();
-    try { fs.unlinkSync(this.outPath); } catch (e) { }
-    try { fs.unlinkSync(this.manifestPath); } catch (e) { }
-    this.emit('cancelled', { id: this.id });
-  }
+  child.on('error', (err) => {
+    console.error(`[${type}] Failed to start:`, err);
+    onError(err);
+  });
+
+  return child;
 }
 
-class DownloadManager extends EventEmitter {
-  constructor() {
-    super();
-    this.tasks = new Map();
-    this.counter = 1;
-
-    // Use Advanced QueueManager
-    this.queueManager = new QueueManager(this);
-
-    this._fetchSettings();
-  }
-
-  async _fetchSettings() {
-    try {
-      const res = await fetch('http://127.0.0.1:5000/api/settings');
-      if (res.ok) {
-        const data = await res.json();
-        // Sync setting to queue manager
-        this.queueManager.updateSettings(data);
-      }
-    } catch (e) {
-      console.log('[DownloadManager] API not ready to fetch settings yet. Using defaults.');
-    }
-  }
-
-
-  setPersistencePath(path) {
-    this.statePath = path;
-  }
-
-  saveState() {
-    if (!this.statePath) return;
-    const tasksData = Array.from(this.tasks.values()).map(t => ({
-      id: t.id,
-      url: t.url,
-      outPath: t.outPath,
-      size: t.size,
-      downloaded: t.downloaded,
-      progress: t.size ? (t.downloaded / t.size) * 100 : 0,
-      status: t.error ? 'error' : (t.aborted ? 'paused' : (t.completed ? 'completed' : 'downloading')),
-      dateAdded: t.dateAdded || new Date().toISOString(),
-      ranges: t.ranges,
-      error: t.error ? t.error.message : null,
-      completed: t.completed // persist completed flag
-    }));
-    try {
-      fs.writeFileSync(this.statePath, JSON.stringify(tasksData, null, 2));
-    } catch (e) {
-      console.error('Failed to save state:', e);
-    }
-  }
-
-  loadState(tasksData) {
-    try {
-      if (!tasksData) return;
-      for (const tData of tasksData) {
-        // Reconstruct task
-        const task = new DownloadTask(tData.id, tData.url, tData.file_path || tData.filePath || tData.outPath, {});
-        task.size = tData.size || 0;
-        task.downloaded = tData.progress ? Math.floor((tData.progress / 100) * task.size) : 0;
-        task.ranges = [];
-        task.aborted = tData.status === 'paused' || tData.status === 'failed' || tData.status === 'error';
-        task.error = (tData.status === 'failed' || tData.status === 'error') ? new Error('Previous error') : null;
-        task.completed = tData.status === 'completed';
-
-        // If it was downloading, it's now paused on restore unless we resume everything magically
-        if (tData.status === 'downloading') task.aborted = true;
-
-        this.tasks.set(task.id, task);
-
-        // Crash recovery: automatically restore unfinished downloads gracefully
-        if (tData.status === 'downloading' || tData.status === 'queued' || tData.status === 'scheduled' || tData.status === 'retrying') {
-          console.log(`[CrashRecovery] Re-queuing unfinished task: ${task.id} (Status: ${tData.status})`);
-          task.aborted = false;
-          this.queueManager.enqueue(task.id, {
-            priority: tData.priority || 'normal',
-            scheduledAt: tData.scheduledAt,
-            retryCount: tData.retryCount || 0,
-            status: tData.status
-          });
-        }
-      }
-      this.counter = tasksData.length > 0 ? tasksData.length + 1 : 1;
-      this.queueManager.processQueue();
-    } catch (e) {
-      console.error('Failed to load state:', e);
-    }
-  }
-
-  getAllTasks() {
-    return Array.from(this.tasks.values()).map(t => ({
-      id: t.id,
-      url: t.url,
-      outPath: t.outPath,
-      size: t.size,
-      downloaded: t.downloaded,
-      priority: t.priority || 'normal',
-      scheduledAt: t.scheduledAt,
-      retryCount: t.retryCount || 0,
-      status: t.error ? 'error' : (t.aborted ? 'paused' : (t.completed ? 'completed' : (t.status || 'downloading'))),
-    }));
-  }
-
-  delete(id) {
-    const task = this.tasks.get(id);
-    if (task) {
-      task.cancel();
-      this.queueManager.remove(id);
-      this.tasks.delete(id);
-      return true;
-    }
-    return false;
-  }
-
-  async create(url, outPath, options, id) {
-    const newId = id || `dl-${Date.now()}-${this.counter++}`;
-
-    // Use classifier to intelligently route task type
-    let meta = null;
-    try {
-      meta = await classify(url, options.headers || {});
-    } catch (e) {
-      console.warn('[DownloadManager] classify() failed, falling back to DownloadTask:', e.message);
-    }
-
-    // Allow explicit override from caller (e.g. from IPC with pre-classified data)
-    const protocol = options.protocol || (meta && meta.protocol) || 'direct';
-    const isYtdl = options.type === 'youtube' || (meta && meta.requiresYtdl);
-    if (isYtdl) options.requiresYtdl = true; // Ensure flag is passed to task
-    
-    const isStream = protocol === 'hls' || protocol === 'dash' || options.type === 'stream';
-
-
-    let task;
-    if (isStream) {
-      task = new StreamTask(newId, url, outPath, { ...options, variantUrl: options.variantUrl });
-    } else if (isYtdl) {
-      // YouTube path — use standard DownloadTask which has _startYouTubeDownload() inside
-      task = new DownloadTask(newId, url, outPath, options);
-    } else if (protocol === 'direct') {
-      // Attempt segmented download for direct files
-      task = new SegmentedDownloader(newId, url, outPath, options);
-
-      // Listen for fallback event if server doesn't support ranges
-      task.once('_fallback', async ({ reason, size }) => {
-        console.log(`[DownloadManager] SegmentedDownloader fallback (${reason}), switching to standard DownloadTask`);
-        const fallbackTask = new DownloadTask(newId, url, outPath, options);
-        fallbackTask.size = size;
-
-        // Replace the task in the map and transfer event listeners
-        this.tasks.set(newId, fallbackTask);
-        this._attachTaskListeners(fallbackTask, newId);
-
-        // Notify QueueManager of the swap if the task is already active
-        if (this.queueManager.active.has(newId)) {
-          this.queueManager.active.set(newId, fallbackTask);
-          // Reinstate handlers on the new task
-          this.queueManager._attachTaskHandlers(fallbackTask);
-          // Start the fallback
-          fallbackTask.start().catch(err => {
-            console.error(`[DownloadManager] Fallback task start failed:`, err.message);
-          });
-        }
-      });
-    } else {
-      task = new DownloadTask(newId, url, outPath, options);
-    }
-
-    // Attach resolved metadata for display purposes
-    if (meta) {
-      task.classifiedMeta = meta;
-      if (!task.size && meta.size) task.size = meta.size;
-    }
-
-    this.tasks.set(newId, task);
-    this._attachTaskListeners(task, newId);
-
-    // Enter advanced queue instead of auto-starting
-    this.queueManager.enqueue(newId, options);
-
-    return task;
-  }
-
-  /**
-   * Helper to attach all necessary event listeners to a task.
-   */
-  _attachTaskListeners(task, id) {
-    task.on('progress', (p) => {
-      this.emit('download', { id, event: 'progress', payload: p });
-      this.saveState();
-    });
-    task.on('finished', (p) => {
-      this.emit('download', { id, event: 'finished', payload: p });
-      this.saveState();
-    });
-    task.on('error', (e) => {
-      task.error = e;
-      this.emit('download', { id, event: 'error', payload: { message: e.message } });
-      this.saveState();
-    });
-    task.on('started', (p) => {
-      task.error = null;
-      this.emit('download', { id, event: 'started', payload: p });
-      this.saveState();
-    });
-    task.on('paused', () => {
-      this.emit('download', { id, event: 'paused' });
-      this.saveState();
-    });
-    task.on('resumed', (p) => {
-      this.emit('download', { id, event: 'resumed', payload: p });
-      this.saveState();
-    });
-    task.on('cancelled', (p) => {
-      this.emit('download', { id, event: 'cancelled', payload: p });
-      this.saveState();
-    });
-    task.on('merging', (p) => {
-      this.emit('download', { id, event: 'merging', payload: p });
-    });
-    task.on('live-stream', () => {
-      this.emit('download', { id, event: 'error', payload: { message: 'Live streams are not supported.' } });
-    });
-  }
-
-  /**
-   * Stop and remove a task completely
-   */
-  delete(id) {
-    console.log(`[DownloadManager] Deleting task: ${id}`);
-    const task = this.tasks.get(id);
-    if (task) {
-      if (task.pause) task.pause();
-      this.tasks.delete(id);
-    }
-    this.queueManager.remove(id);
-    this.saveState();
-    return true;
-  }
-}
-
-module.exports = { DownloadManager, DownloadTask };
+module.exports = { startDownload, getEngineType };
